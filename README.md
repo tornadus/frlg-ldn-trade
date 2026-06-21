@@ -9,7 +9,7 @@ A proof-of-concept demonstrating that it is indeed possible for a computer to in
 This project basically exists to prove that it can be done. From here, I'm hoping the community takes notice so that we can get things like an unofficial GTS and online battling going. It should serve as a pretty good reference for anyone interested in pursuing these goals or anything else related to multiplayer within these games. And before you ask, yes, **AI tools were used extensively during the creation of this project**. Difficult to call it "vibe coding" though, Claude required A LOT of steering and was basically lost without me laying out the path forward step-by-step. The main benefit was massively speeding up the reverse engineering work.
 
 ## Demonstration
-[Video Here]
+https://github.com/user-attachments/assets/b0df878e-67f0-483d-ae81-583cfc2a8692
 
 This demo was recorded using the **ALFA AWUS036ACHM**. The RZ616 is half as fast on average and sometimes deadlocks before gracefully exiting.
 

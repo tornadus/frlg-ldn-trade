@@ -32,6 +32,7 @@ This demo was recorded using the **ALFA AWUS036ACHM**. The RZ616 is half as fast
 |------------------|----------------|---------|---------------
 | AMD RZ616        | Internal (M.2) | mt7921e | Low          |
 | ALFA AWUS036ACHM | External       | mt76x0u | High         |
+| Realtek RTL8821CE | Internal (PCIe 1x) | rtw88_8821ce | High |
 
 ### Known Problematic WiFi Cards
 
@@ -48,7 +49,7 @@ This demo was recorded using the **ALFA AWUS036ACHM**. The RZ616 is half as fast
 | Flag         | Options          | Purpose        |
 |--------------|------------------|----------------|
 | --verbose    | N/A              | Verbose output  |
-| --phy        | phy# (i.e phy1)  | WiFi phy selection |
+| --phy        | phy# (e.g. phy1)  | WiFi phy selection |
 | --keys       | /path/to/prod.keys | non-default prod.keys location |
 
 Above is the configuration I suggest using if you'd like a quick and easy demonstration of the program. You can use any of the listed optional flags, they're safe. Many of the undocumented ones are either unfinished, untested, internal tools, or artifacts of experiments that did not/have not yet panned out.

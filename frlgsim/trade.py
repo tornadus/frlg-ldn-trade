@@ -1,6 +1,6 @@
 """The JOINER trade FSM - reacts to host verdicts, drives the block sub-FSM.
 
-The sim is a clock-slave Follower: it stages blocks, supplies them when the Leader pulls with
+The sim is a reactive Follower: it stages blocks, supplies them when the Leader pulls with
 SEND_BLOCK_REQ (host-SIZED), pushes its own 20-byte LINKCMD blocks, and REACTS to the Leader's
 broadcasts (SET_MONS -> START -> CONFIRM_FINISH). It never emits SET_MONS/START/CONFIRM/cancel
 broadcasts [trade.c:1637-1666].
@@ -135,10 +135,15 @@ SAVE_BARRIER_GAP = 60
 SAVE_CHAIN_TIMEOUT = 600
 
 # Frames of host block-inactivity before we treat BufferTradeParties as finished WITHOUT having seen the
-# ribbons block [READY_TO_TRADE gate, offline fallback]. The LIVE host always streams mail+ribbons (so
-# _got_ribbons fires), but the offline MockHost sends only the party - so after it goes idle past this
-# many frames we proceed. Generous so a real host's ~2-3s inter-block-pull gaps never false-trigger it.
-BUFFERTRADE_SETTLE = 220
+# ribbons block [READY_TO_TRADE / cancel-to-leave gate, last-resort fallback]. The LIVE host ALWAYS
+# streams mail+ribbons and the reliable layer delivers them, so _got_ribbons normally fires; this fallback
+# only exists to avoid hanging on a genuinely dead host. It must be well above any real host pause: the
+# host's post-trade save-writes stall it 0.3-1.8s between block pulls, and firing during such a pause sends
+# the cancel-to-leave BEFORE the host's mail/ribbons - exactly the deadlock the gate is meant to avoid (the
+# host then waits for our select mid-BufferTradeParties while we wait for BOTH_CANCEL). 220f (~3.7s) was
+# close enough to a real pause to false-trigger; 600f (~10s) matches the dead-host SAVE_CHAIN_TIMEOUT
+# philosophy - long enough that only a truly vanished host trips it.
+BUFFERTRADE_SETTLE = 600
 
 # Block counts (= ceil(size/12)) for the entry-phase trainer card: 100B -> 9 fragments.
 COUNT_TRAINER_CARD = 9      # ceil(100/12)
@@ -1377,7 +1382,7 @@ class TradeEngine:
         # reference capture's guest emits count=0 (post-LinkPlayer) then count=1 (post-card), mutual barriers the host gates
         # on. We drive the count PHASE-wise (0 until the card is pulled, 1 after) rather than via the
         # shared barrier's auto-count, whose reactive mirror the host's repeated echoes would reset. The
-        # clock-slave paces these one-per-host-slot (the host streams idle keepalives while it waits).
+        # sim emits these one per VBlank (free-run); the host streams idle keepalives while it waits.
         if self.established and not self._host_in_seat:
             wcount = 0 if not self.entry.card_supplied else 1
             # BOUNDED burst (NOT a flood): emit the round's count up to WARP_STANDBY_EMITS NEW frames,

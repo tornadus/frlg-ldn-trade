@@ -29,23 +29,31 @@ from frlgsim import transport as tmod, linkstate as lsmod  # noqa: E402
 from frlgsim import barrier as lsmod_barrier, pia_connect  # noqa: E402
 
 
+_START = time.monotonic()   # session origin for the elapsed-time stamp on every log line
+
+
 class _Log:
     """Two-level console logger. Calling it prints a DETAIL line (only with --verbose); .info()
     prints a clean, identifier-free MILESTONE line (only WITHOUT --verbose). So a default run
     narrates the session's state changes with no personal data, while --verbose gives the full
-    wire-level trace. `prefix` is prepended to detail lines (the trade engine uses "  [trade]")."""
+    wire-level trace. `prefix` is prepended to detail lines (the trade engine uses "  [trade]").
+    Every line is stamped with seconds since session start, so a pause between milestones (e.g. the
+    host taking its time to walk into the trade room) is visible as the gap between two stamps."""
 
     def __init__(self, verbose, prefix=""):
         self.verbose = verbose
         self.prefix = prefix
 
+    def _ts(self):
+        return f"[{time.monotonic() - _START:7.1f}s]"
+
     def __call__(self, *a):
         if self.verbose:
-            print(self.prefix, *a) if self.prefix else print(*a)
+            print(self._ts(), self.prefix, *a) if self.prefix else print(self._ts(), *a)
 
     def info(self, *a):
         if not self.verbose:
-            print(*a)
+            print(self._ts(), *a)
 
 
 def parse_slots(spec, trades, party_len):
@@ -122,11 +130,11 @@ def run_live(args, lg):
     parent_pid = bytes.fromhex(args.parent_pid) if args.parent_pid else t.parent_pid
     if parent_pid:
         src = "override" if args.parent_pid else "beacon idx20-21"
-        lg(f"[live] gba-app connect: will send 'C' with parent RFU id {parent_pid.hex()} "
+        lg(f"[live] emulator connect: will send 'C' with parent RFU id {parent_pid.hex()} "
               f"({src}). The host's 'A' (0x41) accept confirms it; if no 'A' arrives, try "
               f"--parent-pid with the struct id-field value logged above.")
     else:
-        lg("[live] gba-app connect: no parent RFU id (beacon too short / not parsed) -> NOT "
+        lg("[live] emulator connect: no parent RFU id (beacon too short / not parsed) -> NOT "
               "sending a 'C' frame. Pass --parent-pid to force one.")
     s = simmod.Sim(t, pc, engine, t.our_ip, t.host_ip, conn=conn, compress=args.compress,
                    linkstate=lstate, parent_pid=parent_pid, capture_path=args.capture, log=lg)
@@ -183,7 +191,7 @@ def run_live(args, lg):
                 lg("[live] ABORT: host rejected our join (NI status != JOIN_GROUP_OK) - leaving.")
                 lg.info("Host rejected our join; leaving.")
                 break
-            # host closed the RFU link (gba-app 'D'): the link is down, stop cleanly.
+            # host closed the RFU link (emulator 'D'): the link is down, stop cleanly.
             if getattr(s, "host_disconnected", False):
                 lg("[live] host closed the RFU link ('D' 0x44) - disconnecting.")
                 break
@@ -201,7 +209,7 @@ def run_live(args, lg):
                 continue
             if not connect_announced:
                 lg(f"[live] Pia connection ESTABLISHED - host confirmed us "
-                      f"(conn={conn.state} after {connect_ticks}f). Awaiting the gba-app RFU "
+                      f"(conn={conn.state} after {connect_ticks}f). Awaiting the emulator RFU "
                       f"connect/'A' + NI handshake + LinkPlayer exchange before sitting.")
                 connect_announced = True
             if not announced_established and engine.established:
@@ -358,7 +366,7 @@ def main():
                          "--trust-pia re-enables send-once")
     ap.add_argument("--compress", action="store_true", help="zstd-compress OUT payloads")
     ap.add_argument("--parent-pid", default="",
-                    help="(live) override the parent's RFU id (hex) for the gba-app connect ('C') "
+                    help="(live) override the parent's RFU id (hex) for the emulator connect ('C') "
                          "frame [rfu_REQ_startConnectParent]. Default: extracted from the host's "
                          "beacon (the session-varying parent id). Pass e.g. 7036 to try the struct "
                          "id-field instead.")
@@ -367,7 +375,7 @@ def main():
     mode.add_argument("--live", action="store_true", help="join the real Switch")
     mode.add_argument("--replay", metavar="CAPTURE", help="offline: replay a capture's host stream")
     ap.add_argument("--password", default="", help="LDN passphrase as hex (live); default = "
-                    "the built-in 64-byte gba-app passphrase (shared by FRLG/RSE)")
+                    "the built-in 64-byte emulator passphrase (shared by FRLG/RSE)")
     ap.add_argument("--phy", default="phy0", help="wifi phy for the LDN join (live)")
     ap.add_argument("--keys", default="~/.switch/prod.keys", help="Switch prod.keys (live)")
     ap.add_argument("--comm-id", help="LDN local_communication_id (hex) to join (live); "

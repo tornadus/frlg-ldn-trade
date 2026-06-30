@@ -16,6 +16,8 @@ gPlayerParty is 6 slots (600B) sent as three 200B blocks, empty slots = zeroed s
 
 # ── Gen-3 mon decode oracle (checksum + species/text), inlined from a separate
 #    traffic-sniffing tool so frlgsim stands alone. ────────────────────────────────
+from . import stats
+
 # Substructure order by (personality % 24); each string = logical struct in physical
 # slots 0..3.  G=Growth(0) A=Attacks(1) E=EVs(2) M=Misc(3).
 SUBSTRUCT_ORDER = [
@@ -172,9 +174,10 @@ class Mon:
         """Accept a PKHeX mon in EITHER form - .ek3 (encrypted, the raw save/wire format) or
         .pk3 (decrypted) - in 80-byte box or 100-byte party size. Auto-detects: if the bytes
         already checksum-validate they are the encrypted wire form; otherwise they are decrypted
-        and we encrypt+shuffle them. An 80-byte box is widened to 100B with a ZEROED party tail
-        (trade still succeeds - the host validates only the box checksum - but for correct shown
-        level/stats supply a 100-byte party export). Internally a Mon always holds the wire form."""
+        and we encrypt+shuffle them. A box export carries no party tail (level/stats), so we derive
+        it from the box data - both an 80-byte box widened to 100B and a 100-byte export with a
+        zeroed tail otherwise show as level 0 on the receiver. Internally a Mon always holds the
+        wire form."""
         data = bytes(data)
         if len(data) not in (BOX_SIZE, PARTY_MON_SIZE):
             raise ValueError(f".pk3/.ek3 must be {BOX_SIZE} or {PARTY_MON_SIZE} bytes, "
@@ -191,11 +194,19 @@ class Mon:
             enc = to_encrypted(data)                   # treat as .pk3 (decrypted) -> shuffle + encrypt
             wire = enc if _wire_valid(enc) else data   # fall back to as-is (e.g. bad egg)
         if len(wire) == BOX_SIZE:
-            # widen an 80B box to 100B party: zero the tail BUT set mail = MAIL_NONE (0xFF) - a zeroed
-            # mail byte reads as mail slot 0, which the host treats as real mail on the OFFERED mon.
+            # Widen an 80B box to 100B party. Default mail = MAIL_NONE (0xFF): a zeroed mail byte
+            # reads as mail slot 0, which the host treats as real mail on the OFFERED mon. The tail
+            # recompute below overwrites this with the full tail when stats are derivable.
             wire = bytearray(wire) + b"\x00" * (PARTY_MON_SIZE - BOX_SIZE)
             wire[85] = 0xFF                            # struct Pokemon.mail = MAIL_NONE
             wire = bytes(wire)
+        # A missing party tail (box export / widened box) reads as level 0 with zero stats on the
+        # receiver. Derive level + stats from the box data when, and only when, the tail is absent
+        # (level byte 0); a valid party export keeps its own tail. The tail is not checksummed.
+        if _wire_valid(wire) and wire[84] == 0:
+            tail = stats.build_party_tail(to_decrypted(wire))
+            if tail is not None:
+                wire = wire[:BOX_SIZE] + tail
         return cls(wire)
 
     @classmethod

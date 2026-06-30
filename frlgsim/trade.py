@@ -37,8 +37,8 @@ PARTY_SIZE = 6
 # Block counts (= ceil(size/12)) used to classify a completed peer-0 block.
 COUNT_LINKCMD = 2
 COUNT_PARTY = 17
-COUNT_MAIL = 19         # host mail block (PARTY_SIZE*sizeof(Mail)+4 = 220B, ceil 19)
-COUNT_RIBBON = 4        # host giftRibbons block (40B, ceil 4)
+COUNT_MAIL = 19         # host mail block: 208B payload (PARTY_SIZE*sizeof(Mail=34)+4) in the fixed 220B buffer -> ceil(220/12)
+COUNT_RIBBON = 4        # host giftRibbons block: 11B payload (giftRibbons[11]) in the fixed 40B buffer -> ceil(40/12)
 
 # CheckValidityOfTradeMons return values [include/constants/trade.h:31-34].
 PLAYER_MON_INVALID = 0          # our selected mon is the last alive mon

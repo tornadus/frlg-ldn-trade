@@ -25,40 +25,63 @@ PROTO_UDP = 17
 PIA_PORT = 12345
 
 
-def _dump_beacon(app_data, log):
-    """Dump the LDN advertisement application data (the emulator's RFU SEARCH BEACON). The parent's
-    RFU id - which the child must echo in its emulator connect ('C') frame [decomp: the child reads
-    partner[].id from the parent's beacon; rfu_REQ_startConnectParent] - is carried in here. The
-    wiki documents only the Pia 6.16-6.41 system header (0x5C bytes); the emulator payload after it
-    is undocumented, so dump it RAW to locate the parent id from real data (no guessing)."""
-    if not app_data:
-        log("[live] beacon: NO application_data on the advertisement (cannot locate parent RFU id)")
-        return None
-    log(f"[live] beacon application_data ({len(app_data)} B): {app_data.hex()}")
-    if len(app_data) >= 0x5C:
-        gba = app_data[0x5C:]
-        log(f"[live] beacon emulator payload (after the 0x5C Pia system header, {len(gba)} B): "
-            f"{gba.hex()}")
-    # orient the structure: printable ASCII runs (gname/username) + where the reference capture's parent id recurs.
-    runs = []
-    cur = b""
-    for b in app_data:
-        if 0x20 <= b < 0x7F:
-            cur += bytes([b])
+_PIA_HDR = 0x5C     # Pia 6.16-6.41 LDN system header (sysCommVer 21/22); the game payload follows it
+
+
+def _b85_decode(s):
+    """Decode the custom base85 used for the RFU beacon payload: alphabet 0x23..0x78 skipping 0x5c
+    ('\\'), first char = least-significant digit, 4-byte little-endian groups. len(s) is truncated to
+    a multiple of 5."""
+    out = bytearray()
+    for i in range(0, len(s) - len(s) % 5, 5):
+        v = 0
+        for c in reversed(s[i:i + 5]):                  # reversed: first char is the LOW digit
+            v = v * 85 + ((c - 0x23) if c < 0x5C else (c - 0x24))
+        out += (v & 0xFFFFFFFF).to_bytes(4, "little")
+    return bytes(out)
+
+
+def _frlg_name(b):
+    """Render a name from the FRLG character set (letters/digits) for the beacon dump."""
+    out = []
+    for x in b:
+        if x == 0xFF:
+            break
+        if 0xBB <= x <= 0xD4:
+            out.append(chr(ord("A") + x - 0xBB))
+        elif 0xD5 <= x <= 0xEE:
+            out.append(chr(ord("a") + x - 0xD5))
+        elif 0xA1 <= x <= 0xAA:
+            out.append(chr(ord("0") + x - 0xA1))
         else:
-            if len(cur) >= 3:
-                runs.append(cur.decode())
-            cur = b""
-    if len(cur) >= 3:
-        runs.append(cur.decode())
-    if runs:
-        log(f"[live] beacon ASCII runs: {runs}")
-    for needle in (b"\x67\x79", b"\x79\x67"):
-        off = app_data.find(needle)
-        if off >= 0:
-            log(f"[live] beacon: the reference parent-id bytes {needle.hex()} present at offset 0x{off:x} "
-                f"(same Switch -> candidate parent RFU id location)")
-    return bytes(app_data)
+            out.append(" " if x == 0 else "?")
+    return "".join(out).rstrip()
+
+
+def _dump_beacon(app_data, log):
+    """Dump the host's LDN advertisement application data (the RFU search beacon). It is a Pia
+    6.16-6.41 system header (0x5C bytes: Switch nickname etc.) followed by the game payload, a
+    custom-base85-encoded 24-byte RFU record (player trainer id, in-game name, RFU session id, partner
+    info, game data). Diagnostics only - the connect id is not taken from here; it is a random nonzero
+    value."""
+    if not app_data:
+        log("[live] beacon: NO application_data on the advertisement")
+        return None
+    app_data = bytes(app_data)
+    log(f"[live] beacon application_data ({len(app_data)} B): {app_data.hex()}")
+    if len(app_data) >= _PIA_HDR:
+        gba = app_data[_PIA_HDR:]
+        log(f"[live] beacon RFU payload (after the 0x5C Pia header, {len(gba)} B): {gba.hex()}")
+        try:                                            # never let an odd beacon abort the join
+            d = _b85_decode(gba)
+            if len(d) >= 24:
+                log(f"[live] beacon decoded: host name={_frlg_name(d[2:10])!r} "
+                    f"TID=0x{int.from_bytes(d[0:2], 'little'):04x} "
+                    f"RFU-session-id=0x{int.from_bytes(d[10:12], 'little'):04x} "
+                    f"tradeSpecies={int.from_bytes(d[20:24], 'little') >> 16}")
+        except Exception as e:
+            log(f"[live] beacon decode skipped ({type(e).__name__}: {e})")
+    return app_data
 
 
 def _flatten_exc(e, depth=0):
@@ -284,7 +307,6 @@ class LiveTransport:
         self.our_mac = None        # our 6-byte LDN MAC = our Pia connection GUID (constant id)
         self.host_mac = None       # the host's 6-byte LDN MAC = its Pia connection GUID
         self.app_data = None       # the host's LDN advertisement beacon (emulator RFU search data)
-        self.parent_pid = None     # parent RFU id extracted from the beacon (for the gba connect)
         self.iface = None
         self.broadcast = None
         self._tx = None
@@ -369,20 +391,10 @@ class LiveTransport:
                 self._ready.set()
                 return
             self.LOCAL_COMMUNICATION_ID = net.local_communication_id
-            # The advertisement's application data is the emulator's RFU search beacon; the parent
-            # RFU id for our emulator connect frame lives here (learned, never guessed).
-            self.app_data = _dump_beacon(bytes(getattr(net, "application_data", b"") or b""),
-                                         self.log)
-            # The 30-byte gba payload is a Sloop-obfuscated RfuTgtData (parent discovery record).
-            # idx 20-21 carries a 0x67xx value whose HIGH byte matches the reference capture's 'C' pid 0x6779
-            # (same Switch, different session) - the session-varying parent RFU id. Extract it for the
-            # emulator connect frame; the host's 'A' accept confirms it. (--parent-pid overrides.)
-            if self.app_data and len(self.app_data) >= 0x5C + 22:
-                gba = self.app_data[0x5C:]
-                self.parent_pid = gba[20:22]
-                self.log(f"[live] beacon-derived parent RFU id = {self.parent_pid.hex()} "
-                         f"(gba idx20-21; the reference capture's pid 6779 shared the 0x67 high byte). "
-                         f"struct id-field idx0-1={gba[0:2].hex()}")
+            # The advertisement's application data is the RFU search beacon (dumped + decoded for
+            # diagnostics). The connect id is not taken from here: any nonzero value works, so it is a
+            # random nonzero value chosen locally.
+            self.app_data = _dump_beacon(getattr(net, "application_data", b"") or b"", self.log)
             param = ldn.ConnectNetworkParam()
             param.keys = keys
             param.network = net

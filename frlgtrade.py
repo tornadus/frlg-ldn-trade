@@ -127,17 +127,19 @@ def run_live(args, lg):
     # the RIGHT seat (mpId 1), then cancel-to-leave after the configured trade(s). self_id is
     # asserted == 1 (the joiner / RIGHT seat) [frlgsim/linkstate.py; trade.c:1816].
     lstate = lsmod.LinkState(self_id=args.self_id, log=lg)
-    parent_pid = bytes.fromhex(args.parent_pid) if args.parent_pid else t.parent_pid
-    if parent_pid:
-        src = "override" if args.parent_pid else "beacon idx20-21"
-        lg(f"[live] emulator connect: will send 'C' with parent RFU id {parent_pid.hex()} "
-              f"({src}). The host's 'A' (0x41) accept confirms it; if no 'A' arrives, try "
-              f"--parent-pid with the struct id-field value logged above.")
+    # emulator RFU connect id: our OWN 2-byte RFU connection id sent in the 'C' frame. Any nonzero
+    # value works (the host does not match it, it just seats our slot), so we pick a random nonzero
+    # one. A FRESH id per run also avoids the host's ~40s lost-id re-join lockout that reusing a value
+    # would hit. --connect-id (alias --parent-pid) overrides for debugging.
+    if args.connect_id:
+        connect_id = bytes.fromhex(args.connect_id)
     else:
-        lg("[live] emulator connect: no parent RFU id (beacon too short / not parsed) -> NOT "
-              "sending a 'C' frame. Pass --parent-pid to force one.")
+        connect_id = (int.from_bytes(os.urandom(2), "big") or 1).to_bytes(2, "big")
+    lg(f"[live] emulator connect: will send 'C' with connect id {connect_id.hex()} "
+          f"({'override' if args.connect_id else 'random nonzero'}); the host's 'A' (0x41) accept "
+          f"seats our slot - the value need not match anything on the host.")
     s = simmod.Sim(t, pc, engine, t.our_ip, t.host_ip, conn=conn, compress=args.compress,
-                   linkstate=lstate, parent_pid=parent_pid, capture_path=args.capture, log=lg)
+                   linkstate=lstate, connect_id=connect_id, capture_path=args.capture, log=lg)
     if args.capture:
         lg(f"[live] capturing every Pia datagram (both dirs) -> {args.capture} "
               f"(decrypt/analyse offline afterward)")
@@ -365,11 +367,10 @@ def main():
                          "workaround for the 'flood', but that was the RTT deadlock (now fixed). "
                          "--trust-pia re-enables send-once")
     ap.add_argument("--compress", action="store_true", help="zstd-compress OUT payloads")
-    ap.add_argument("--parent-pid", default="",
-                    help="(live) override the parent's RFU id (hex) for the emulator connect ('C') "
-                         "frame [rfu_REQ_startConnectParent]. Default: extracted from the host's "
-                         "beacon (the session-varying parent id). Pass e.g. 7036 to try the struct "
-                         "id-field instead.")
+    ap.add_argument("--connect-id", "--parent-pid", dest="connect_id", default="",
+                    help="(live) override the RFU connection id (hex, e.g. 7036) sent in the emulator "
+                         "connect ('C') frame. Default: a random nonzero id - any nonzero value works. "
+                         "--parent-pid is a deprecated alias.")
     ap.add_argument("--verbose", action="store_true")
     mode = ap.add_mutually_exclusive_group(required=True)
     mode.add_argument("--live", action="store_true", help="join the real Switch")

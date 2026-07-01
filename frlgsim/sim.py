@@ -125,7 +125,7 @@ TS_SEED = 0x0000362E
 class Sim:
     def __init__(self, transport, pia_crypto, engine, our_ip, host_ip, *, conn=None,
                  our_var=0xc493, compress=False, header_flags=0x50, capture_path=None,
-                 linkstate=None, parent_pid=None, log=lambda *a: None):
+                 linkstate=None, connect_id=None, log=lambda *a: None):
         self.t = transport
         self.crypto = pia_crypto
         self.engine = engine
@@ -227,10 +227,11 @@ class Sim:
         self._ack_owed = False           # received host reliable DATA we haven't bulk-acked yet
         self._last_ack_tick = -100       # last tick we emitted a ctrl bulk-ack (steady-cadence floor)
         self._tick = 0                   # VBlank counter, drives the retransmit timers
-        # emulator RFU connect ('C') frame: the parent's RFU id (2 bytes), LEARNED from the host's
-        # search beacon (transport.app_data) - NEVER guessed. None => we don't yet know it, so we
-        # do NOT send a 'C' frame (the host stays in the bulk-ack-only state until we supply it).
-        self._parent_pid = bytes(parent_pid) if parent_pid else None
+        # emulator RFU connect ('C') frame: our OWN 2-byte RFU connection id, self-chosen. Any nonzero
+        # value works - the host does not match it, it just seats our slot - so a random nonzero id is
+        # passed in. None (offline replay/tests) => we do NOT send a 'C' (the host stays bulk-ack-only
+        # until it sees one).
+        self._connect_id = bytes(connect_id) if connect_id else None
         self._gba_conn_sent = False
         self._gba_accepted = False        # have we seen the host's emulator connect accept ('A')
         # Emission is FREE-RUN: _drive_reliable emits one child slot ('T') per local VBlank, on our own
@@ -358,7 +359,7 @@ class Sim:
         if typ == "A" and not self._gba_accepted:
             self._gba_accepted = True              # host's emulator connect ACCEPT (0x41)
             self.log(f"[sim] host ACCEPTED emulator connect ('A' 0x41): {payload[:10].hex()} "
-                     f"-> parent pid is CORRECT; RFU link up, starting the NI handshake")
+                     f"-> our slot is seated; RFU link up, starting the NI handshake")
             self.info("Host accepted the link.")
             return
         if typ == gbaframe.TYPE_D and not self.host_disconnected:
@@ -544,11 +545,11 @@ class Sim:
             self._tx_reliable(seq, reliable.FLAGSA_INIT, reliable.METADATA_FRAME)
             self._rel_opened = True
             return                        # the stream opens with the metadata ('J') frame alone
-        if self._parent_pid is not None and not self._gba_conn_sent:
-            # emulator RFU connection request ('C', rfu_REQ_startConnectParent) - the host won't send its
-            # accept ('A') or start its slot ('T') stream until it sees this. We only send it once we know
-            # the parent's RFU id (from the beacon); never with a guessed value.
-            frame = gbaframe.build_connect(self._parent_pid)
+        if self._connect_id is not None and not self._gba_conn_sent:
+            # emulator RFU connect request ('C') - the host won't send its accept ('A') or start its
+            # slot ('T') stream until it sees this. `connect_id` is our self-chosen id; any nonzero
+            # value works.
+            frame = gbaframe.build_connect(self._connect_id)
             seq = self.rel.queue(frame, reliable.FLAGSA_GBA, now_ms)
             self._tx_reliable(seq, reliable.FLAGSA_GBA, frame)
             self._gba_conn_sent = True

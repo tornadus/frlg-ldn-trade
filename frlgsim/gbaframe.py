@@ -23,7 +23,7 @@ SLOT_LEN = 14
 # emulator RFU control frame types (ASCII mnemonics): 'J'=join/metadata(configGameData),
 # 'C'=connect request (rfu_REQ_startConnectParent), 'A'=host accept, 'K'=data ack, 'T'=slot data.
 TYPE_J, TYPE_C, TYPE_A = 0x4A, 0x43, 0x41
-TYPE_D = 0x44           # host emulator DISCONNECT ('D' = 57 44 02 00 <parent_pid>)
+TYPE_D = 0x44           # host emulator DISCONNECT ('D' = 57 44 02 00 <connect_id>)
 
 
 def build_gba_frame(ftype, data):
@@ -32,12 +32,13 @@ def build_gba_frame(ftype, data):
     return bytes([GBA_MARKER, ftype]) + len(data).to_bytes(2, "little") + bytes(data)
 
 
-def build_connect(parent_pid):
-    """The joiner's emulator RFU connection request [reference capture #16: 57 43 02 00 67 79]. `parent_pid` is
-    the PARENT's RFU id (2 bytes) the child connects to (rfu_REQ_startConnectParent(pid)
-    [librfu_rfu.c:753]) - LEARNED from the parent's search beacon, never guessed. The host echoes it
-    in its accept (0x41: <child_id> <parent_pid> 0000)."""
-    return build_gba_frame(TYPE_C, parent_pid)
+def build_connect(connect_id):
+    """The joiner's emulator RFU connect request (e.g. 57 43 02 00 67 79). `connect_id` is the joiner's
+    OWN 2-byte RFU connection id, self-chosen. Any nonzero value works - the host does not match it
+    against anything, it just seats our slot. The host echoes it back in its accept
+    (0x41: <host_session_id> <connect_id> 0000) and repeats it in the 'D' disconnect, so the same value
+    is reused for the whole session."""
+    return build_gba_frame(TYPE_C, connect_id)
 
 
 def _roundup4(n):
@@ -70,7 +71,8 @@ def parse_in(payload):
     Returns a dict by type:
       'T': {ts, slot_len, llsf_state, slots:[(mpId, 14-byte gRecvCmd)...], positional:<same>, payload}
            (slot_len<=1 => host idle keepalive: ts set, slots/positional empty - still K-ack it)
-      'A': {child_id, parent_pid}    'K': {k_seq, acked_ts}    else {type}
+      'A': {host_session_id, connect_id}    'K': {k_seq, acked_ts}    else {type}
+           (accept fields: body[0:2]=host session id, body[2:4]=our echoed connect id)
     HOST 'T' body = <ts:u32> <slot_len:u8 @body[4]> 00 00 00 <slot>; the slot is a 3-byte PARENT
     LLSF then, for UNI, N x 14-byte gRecvCmds (chunk0=host's own, chunk1=our reflected slot).
 
@@ -115,7 +117,7 @@ def parse_in(payload):
         rec["positional"] = rec["slots"]            # alias: the engine reads `positional`
         return rec
     if typ == TYPE_A:
-        return {"type": "A", "child_id": body[0:2], "parent_pid": body[2:4]}
+        return {"type": "A", "host_session_id": body[0:2], "connect_id": body[2:4]}
     if typ == TYPE_K:
         return {"type": "K", "k_seq": int.from_bytes(body[0:4], "little"),
                 "acked_ts": int.from_bytes(body[8:12], "little") if len(body) >= 12 else None}

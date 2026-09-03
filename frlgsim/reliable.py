@@ -50,7 +50,8 @@ def build_bulk_ack(next_expected, mask=b"\x00" * 16, stream_id=0):
 
 def parse_bulk_ack(payload):
     """-> (ack_id, mask) from a FLAGSA_CTRL payload. ack_id = next-expected seq (every seq below it
-    is acked); mask = 128-bit gap bitmap (`ack_id + 1 + index` is acked when bit `index` is set).
+    is acked); mask = 128-bit gap bitmap (`ack_id + index` is acked when bit `index` is set;
+    bit zero is normally clear because ack_id itself is the cumulative hole).
     Returns (None, b'') if too short."""
     if len(payload) < 4:
         return None, b""
@@ -180,7 +181,7 @@ class ReliableLink:
 
     def on_ack(self, ack_id, mask=None, now_ms=None):
         """Process the peer's bulk-ack. A frame is acknowledged when it is in the cumulative run below
-        ack_id, OR when the selective mask marks it received (bit i set => ack_id+1+i received, LSB-first
+        ack_id, OR when the selective mask marks it received (bit i set => ack_id+i received, LSB-first
         within each byte). Acknowledged frames stop being retransmitted immediately, but the window base
         only advances over the CONTIGUOUS acknowledged run from the base - a mask-acked frame above a gap
         keeps its slot until the gap fills. This is the selective-repeat sender: holes are retransmitted,
@@ -197,8 +198,12 @@ class ReliableLink:
         maskint = int.from_bytes(mask, "little") if mask else 0
         for seq, entry in self.unacked.items():
             arrived = _seq_lt(seq, ack_id)                 # cumulative run below ack_id
-            if not arrived and maskint:                    # selective mask: bit i => ack_id+1+i received
-                i = (seq - ack_id - 1) & 0xFFFF
+            if not arrived and maskint:                    # selective mask: bit i => ack_id+i received
+                # Bit zero corresponds to ack_id itself.  Since ack_id is the
+                # cumulative hole that bit is normally clear; the first
+                # out-of-order sequence (ack_id + 1) is bit one.  Native
+                # capture example: ack_id=fff7, mask=06 marks fff8+fff9.
+                i = (seq - ack_id) & 0xFFFF
                 arrived = i < 128 and bool((maskint >> i) & 1)
             if arrived and not entry[_E_ACKED]:
                 if now_ms is not None and entry[_E_RESENDS] == 0:
@@ -298,14 +303,214 @@ class ReliableLink:
     def ack_payload(self):
         """Bulk-ack: CUMULATIVE next-expected (recv_next) + a SELECTIVE MASK of the out-of-order frames we
         hold (recv_ooo), so the peer fast-retransmits exactly its dropped frames (mask bit i set =>
-        recv_next+1+i received, LSB-first within each byte). recv_ooo is populated by note_received (live
+        recv_next+i received, LSB-first within each byte; bit zero is the cumulative hole and is clear).
+        recv_ooo is populated by note_received (live
         path); on the offline on_data path it stays empty -> zero mask (cumulative-only)."""
         mask = bytearray(16)
         for s in self.recv_ooo:
-            i = (s - self.recv_next - 1) & 0xFFFF
+            i = (s - self.recv_next) & 0xFFFF
             if i < 128:
                 mask[i >> 3] |= (1 << (i & 7))
         return build_bulk_ack(self.recv_next, bytes(mask))
+
+
+@dataclass(frozen=True)
+class ReliableEmission:
+    """One Reliable message ready for the Pia framing layer.
+
+    The host driver deliberately owns Pia addressing, packet ids, encryption,
+    batching and transmission.  Keeping those concerns out of the Reliable
+    state machine makes loss/reordering tests deterministic and lets both host
+    and client transports reuse the same wire codec.
+    """
+
+    seq: int
+    flagsA: int
+    ack: int
+    payload: bytes
+    retransmitted: bool = False
+
+    @property
+    def message_flags(self):
+        # Both native peers put Pia MESSAGE flag 0x40 on pure bulk ACKs and
+        # 0x20 on retransmitted DATA.  These are mutually exclusive here:
+        # control ACKs are never tracked/retransmitted by ReliableLink.
+        if self.flagsA == FLAGSA_CTRL:
+            return 0x40
+        return 0x20 if self.retransmitted else None
+
+    def serialize(self):
+        return build_reliable(self.seq, self.ack, self.payload, self.flagsA)
+
+
+@dataclass(frozen=True)
+class ReliableDelivery:
+    """An in-order, de-duplicated DATA frame delivered by HostReliableSession."""
+
+    seq: int
+    flagsA: int
+    payload: bytes
+
+
+class HostReliableSession:
+    """Transport-independent Pia Reliable leader state machine.
+
+    ``open`` opens the local stream with the caller's first RFU frame.
+    ``receive`` consumes a peer Reliable sub-frame and returns newly available
+    DATA in sequence order.  ``poll`` emits timer/fast retransmissions and the
+    native 0x40 bulk ACK.  New RFU frames are added with ``send``.  Every
+    returned :class:`ReliableEmission` is wrapped as a proto-10 Pia message by
+    the caller; the class never touches sockets, crypto, or packet-id counters.
+
+    The leader and joiner use independent 16-bit streams, both starting at
+    FFF0 in FireRed/LeafGreen.  The roles use different opening payloads: the
+    joiner sends the title metadata, while the native leader first sends its
+    RFU ``A`` accept as an Initialized DATA frame.  Requiring that payload in
+    ``open`` prevents the leader from accidentally copying the joiner flow.
+    A small bootstrap RTO keeps the opening frame alive before RTT samples have
+    reached the Reliable layer.  Once
+    ``note_rtt`` is called, ReliableLink's native median-driven RTO takes over.
+    """
+
+    def __init__(self, start=0xFFF0, *, ack_period_ms=RTO_BASE_MS,
+                 max_inflight=MAX_INFLIGHT, rto_bootstrap_ms=200,
+                 dup_nack_threshold=1, retransmit_limit=None):
+        self.start_seq = start & 0xFFFF
+        self.link = ReliableLink(
+            start=self.start_seq,
+            max_inflight=max_inflight,
+            rto_bootstrap_ms=rto_bootstrap_ms,
+            dup_nack_threshold=dup_nack_threshold,
+        )
+        self.ack_period_ms = float(ack_period_ms)
+        self.retransmit_limit = retransmit_limit
+        self.local_opened = False
+        self.peer_opened = False
+        self._ack_owed = False
+        self._next_ack_ms = None
+
+        # Delivery ordering is intentionally separate from ReliableLink's
+        # receive ACK accounting.  The latter advances immediately and keeps a
+        # selective mask; this buffer holds application data across a gap so
+        # RFU never observes reordering or duplicate retransmits.
+        self._deliver_next = self.start_seq
+        self._deliver_buf = {}
+
+    @property
+    def inflight(self):
+        return self.link.inflight()
+
+    @property
+    def recv_next(self):
+        return self.link.recv_next
+
+    def _emission(self, seq, flagsA, payload, *, retransmitted=False):
+        # ACK/window-base is sampled at actual emission time, including a
+        # retransmission, rather than frozen when the DATA was first queued.
+        return ReliableEmission(seq & 0xFFFF, flagsA, self.link.send_low(), bytes(payload),
+                                retransmitted=retransmitted)
+
+    def open(self, payload, now_ms, flagsA=FLAGSA_GBA):
+        """Open the leader stream with its first RFU payload.
+
+        Native FRLG uses ``A`` (connect accept) here, with Initialized added to
+        the ordinary AppData|Start|End flags.  The method is idempotent so a
+        duplicate child ``C`` cannot allocate a second opening sequence id.
+        """
+        if self.local_opened:
+            return None
+        flagsA = (int(flagsA) | FLAGSA_INIT) & 0xFF
+        payload = bytes(payload)
+        seq = self.link.queue(payload, flagsA, now_ms)
+        self.local_opened = True
+        return self._emission(seq, flagsA, payload)
+
+    def send(self, payload, now_ms, flagsA=FLAGSA_GBA):
+        """Queue one DATA/RFU frame and return the first transmission.
+
+        Callers must respect the peer-facing send window.  Raising instead of
+        silently dropping a frame makes backpressure explicit at integration
+        boundaries.
+        """
+        if not self.local_opened:
+            raise RuntimeError("Reliable stream has not been opened")
+        if self.link.inflight() >= self.link.max_inflight:
+            raise BufferError("Reliable send window is full")
+        flagsA = int(flagsA) & 0xFF
+        if not (flagsA & 0x01):
+            raise ValueError("send() is for Reliable DATA frames, not control ACKs")
+        seq = self.link.queue(bytes(payload), flagsA, now_ms)
+        return self._emission(seq, flagsA, payload)
+
+    def note_rtt(self, rtt_ms):
+        """Feed a completed Pia RTT probe into retransmission timing."""
+        self.link.add_rtt_sample(rtt_ms)
+
+    def _deliver(self, frame):
+        seq = frame.seq
+        if seq == self._deliver_next:
+            ready = [ReliableDelivery(seq, frame.flagsA, bytes(frame.payload))]
+            self._deliver_next = (self._deliver_next + 1) & 0xFFFF
+            while self._deliver_next in self._deliver_buf:
+                buffered = self._deliver_buf.pop(self._deliver_next)
+                ready.append(ReliableDelivery(
+                    buffered.seq, buffered.flagsA, bytes(buffered.payload)))
+                self._deliver_next = (self._deliver_next + 1) & 0xFFFF
+            return ready
+        if _seq_lt(self._deliver_next, seq):
+            self._deliver_buf.setdefault(seq, frame)
+        return []
+
+    def receive(self, wire, now_ms):
+        """Consume one serialized Reliable sub-frame.
+
+        Returns only newly in-order DATA deliveries.  Control frames update the
+        send window and RTT estimator but are never acknowledged themselves.
+        Malformed/truncated frames are ignored.
+        """
+        frame = parse_reliable(bytes(wire))
+        if frame is None or frame.raw_len > len(wire) - 8:
+            return []
+        if not (frame.flagsA & 0x01):
+            ack_id, mask = parse_bulk_ack(frame.payload)
+            self.link.on_ack(ack_id, mask, now_ms=now_ms)
+            return []
+
+        # The peer's fff0 stream-opening DATA must carry Initialized.  Do not
+        # let a malformed/plain frame consume that sequence slot: otherwise a
+        # later valid INIT would look like a duplicate and the stream could
+        # never open.  Future frames may arrive first and are safely SACKed /
+        # buffered across the fff0 gap.
+        if (not self.peer_opened and frame.seq == self.start_seq
+                and not (frame.flagsA & 0x08)):
+            return []
+        if frame.flagsA & 0x08:
+            self.peer_opened = True
+        self.link.note_received(frame.seq)
+        self._ack_owed = True
+        if self._next_ack_ms is None:
+            self._next_ack_ms = float(now_ms) + self.ack_period_ms
+        return self._deliver(frame)
+
+    def poll(self, now_ms):
+        """Return due retransmissions followed by at most one bulk ACK."""
+        emissions = [
+            self._emission(seq, flagsA, payload, retransmitted=True)
+            for seq, flagsA, payload in self.link.due_retransmits(
+                now_ms, limit=self.retransmit_limit)
+        ]
+        ack_due = (self._next_ack_ms is not None
+                   and float(now_ms) >= self._next_ack_ms)
+        if ack_due and (self._ack_owed or self.link.recv_ooo):
+            emissions.append(ReliableEmission(
+                self.start_seq, FLAGSA_CTRL, self.link.send_low(),
+                self.link.ack_payload()))
+            self._ack_owed = False
+            # Keep selectively NACKing a persistent gap at the delayed-ACK
+            # cadence; otherwise no more ACK is scheduled until new DATA.
+            self._next_ack_ms = (float(now_ms) + self.ack_period_ms
+                                 if self.link.recv_ooo else None)
+        return emissions
 
 
 @dataclass

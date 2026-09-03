@@ -1,10 +1,12 @@
 # Published surface: the frlgsim/ simulator package plus the root entry script
 # frlgtrade.py. Everything else is local to this setup.
 
-# Ignore every top-level folder except the frlgsim package.
-# This covers tests/, utils/, notes/, captures/, .backups/, and venv/.
+# Ignore every top-level folder except the frlgsim package and tests.
+# This covers utils/, notes/, captures/, .backups/, and venv/.
 /*/
 !/frlgsim/
+!/tests/
+!/docs/
 
 # Never publish Pokemon data files (live-trade outputs can carry trainer/account
 # identifiers); covers any stray .pk3/.ek3 at the root or inside frlgsim/ too.
@@ -14,3 +16,11 @@
 # Python bytecode (applies inside frlgsim/ as well)
 __pycache__/
 *.pyc
+
+# Runtime logs, protocol traces, and packet captures may contain console,
+# trainer, or network identifiers and should stay local.
+*.log
+*.jsonl
+*.pcap
+*.pcapng
+host-tap-*.txt

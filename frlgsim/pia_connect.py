@@ -36,7 +36,9 @@ NET_UPDATE_PROPERTY_ACK = 0x51   # joiner -> host
 
 # Session(new) message types
 SESSION_JOIN_REQUEST = 0
+SESSION_JOIN_RESPONSE = 2
 SESSION_UPDATE = 5
+SESSION_UPDATE_ACK = 6
 SESSION_LEFT_SYNC = 7
 
 # Session join templated constants (from the reference capture's message #3 - confirm/tune live).
@@ -54,7 +56,11 @@ def parse_net(payload):
     """-> (version, type, body) for a Net message (header = [ver][type][size:u16 BE])."""
     if len(payload) < 4:
         return None
-    return payload[0], payload[1], payload[4:4 + int.from_bytes(payload[2:4], "big")]
+    # `size` is not the complete number of bytes following this header. For example, Net 0x11
+    # stores only the NetStation-array size there (6 * 22 = 0x84), while its 26-byte fixed prefix
+    # is additional; Net 0x12 stores zero while its four-byte sequence id still follows. Return the
+    # complete type-specific body and let the individual message parser interpret the size field.
+    return payload[0], payload[1], payload[4:]
 
 
 def build_net_response(seqid=2):
@@ -62,6 +68,54 @@ def build_net_response(seqid=2):
     The seqid ECHOES the host's 0x11 connection-request seqid (its body[0:4]); hardcoding 2 deadlocks the
     moment the host's network-status seqid differs (endless 500ms 0x11 retransmits -> host send-buffer fill)."""
     return bytes([0x01, NET_CONN_RESPONSE, 0x00, 0x00]) + (seqid & 0xFFFFFFFF).to_bytes(4, "big")
+
+
+def ldn_constant_id(mac):
+    """Derive Pia 6.x's 8-byte LDN constant id from a six-byte physical MAC."""
+    mac = bytes(mac)
+    if len(mac) != 6:
+        raise ValueError("LDN constant id requires a 6-byte MAC")
+    return bytes((mac[2], mac[4], mac[5], mac[3], mac[1], mac[0], 0, 0))
+
+
+def _net_station(ip=None, port=12345, *, migration_state=0, migration_rank=0):
+    """Build the fixed-size Pia 6.39 NetStation used by Net 0x11.
+
+    Its StationAddress is a 16-byte address followed by a BE port. Native FRLG puts IPv4 in the
+    first four bytes and zero-fills the remaining twelve. An empty slot uses rank 0xff and an all-zero
+    address/port.
+    """
+    address = (_ip4(ip) + b"\x00" * 12) if ip is not None else b"\x00" * 16
+    if ip is None:
+        port = 0
+    return (bytes([migration_state & 0xFF, migration_rank & 0xFF, 0, 0])
+            + address + (port & 0xFFFF).to_bytes(2, "big"))
+
+
+def build_net_conn_request(seqid, host_var, host_mac, network_id, stations, max_stations=6):
+    """Build Pia 6.39 Net 0x11 (UpdateNetworkConnectionStatus).
+
+    ``stations`` is an iterable of occupied IPs in join order (host first). Native FRLG always emits
+    all configured slots and fills unused ones with rank 0xff. LDN's network id is a 32-bit SSID CRC
+    carried in the protocol's 8-byte field as a zero-extended integer.
+    """
+    entries = list(stations)
+    if not 1 <= len(entries) <= max_stations:
+        raise ValueError("Net 0x11 needs 1..max_stations occupied station addresses")
+    body = bytearray()
+    body += (seqid & 0xFFFFFFFF).to_bytes(4, "big")
+    body += (_vid(host_var) & 0xFFFF).to_bytes(2, "big")
+    body += ldn_constant_id(host_mac)
+    body += (network_id & 0xFFFFFFFF).to_bytes(8, "big")
+    body += bytes([1])                              # network is open
+    body += max_stations.to_bytes(2, "big")
+    body += bytes([0])                              # not migrating host
+    for rank, ip in enumerate(entries):
+        body += _net_station(ip, migration_rank=rank)
+    for _ in range(max_stations - len(entries)):
+        body += _net_station(migration_rank=0xFF)
+    station_array_size = max_stations * 22
+    return bytes([0x01, NET_CONN_REQUEST]) + station_array_size.to_bytes(2, "big") + body
 
 
 def build_net_property_ack(seqid):
@@ -147,6 +201,168 @@ def build_session_join(src_mac, src_var, src_ip, dst_mac, dst_var, player_name,
     nm = player_name.encode()[:20]                   # PlayerInfo
     out += player_id + len(nm).to_bytes(4, "big") + bytes([1]) + nm
     return bytes(out)
+
+
+def _constant_id8(value):
+    value = bytes(value)
+    if len(value) == 6:
+        return value + b"\x00\x00"
+    if len(value) != 8:
+        raise ValueError("Pia constant id must be 6 or 8 bytes")
+    return value
+
+
+def _parse_player_info(payload, offset):
+    if offset + 21 > len(payload):
+        raise ValueError("truncated Session PlayerInfo")
+    player_id = bytes(payload[offset:offset + 16])
+    name_size = int.from_bytes(payload[offset + 16:offset + 20], "big")
+    encoding = payload[offset + 20]
+    end = offset + 21 + name_size
+    if name_size > 40 or end > len(payload):
+        raise ValueError("invalid Session PlayerInfo name size")
+    return {
+        "player_id": player_id,
+        "encoding": encoding,
+        "name": bytes(payload[offset + 21:end]),
+    }, end
+
+
+def parse_session_join(payload):
+    """Parse a Pia 6.39 Session type-0 join request.
+
+    The returned identity is sufficient for the leader's type-5 session update
+    and type-2 join response.  Invalid or unsupported (non-IPv4) requests
+    return ``None`` instead of letting malformed network input escape into the
+    host loop.
+    """
+    payload = bytes(payload)
+    try:
+        if len(payload) < 2 or payload[0] != SESSION_JOIN_REQUEST:
+            return None
+        nprotocols = payload[1]
+        pos = 2
+        if pos + nprotocols * 2 + 2 + 4 + 8 + 2 + 2 + 32 + 8 + 2 + 2 > len(payload):
+            return None
+        protocols = [(payload[pos + i * 2], payload[pos + i * 2 + 1])
+                     for i in range(nprotocols)]
+        pos += nprotocols * 2
+        app_ver = bytes(payload[pos:pos + 2]); pos += 2
+        random4 = bytes(payload[pos:pos + 4]); pos += 4
+        source_constant_id = bytes(payload[pos:pos + 8]); pos += 8
+        source_var = int.from_bytes(payload[pos:pos + 2], "big"); pos += 2
+        nat_mapping, private_ipv6 = payload[pos], payload[pos + 1]; pos += 2
+        token = bytes(payload[pos:pos + 32]); pos += 32
+        destination_constant_id = bytes(payload[pos:pos + 8]); pos += 8
+        destination_var = int.from_bytes(payload[pos:pos + 2], "big"); pos += 2
+        num_players, num_participants = payload[pos], payload[pos + 1]; pos += 2
+        if pos >= len(payload) or payload[pos] != 0:       # FRLG LDN uses IPv4 here
+            return None
+        pos += 1
+        if pos + 6 > len(payload):
+            return None
+        ip = ".".join(str(x) for x in payload[pos:pos + 4]); pos += 4
+        port = int.from_bytes(payload[pos:pos + 2], "big"); pos += 2
+        players = []
+        for _ in range(num_players):
+            player, pos = _parse_player_info(payload, pos)
+            players.append(player)
+        if pos != len(payload):
+            return None
+        return {
+            "protocols": protocols,
+            "app_ver": app_ver,
+            "random4": random4,
+            "source_constant_id": source_constant_id,
+            "source_var": source_var,
+            "nat_mapping": nat_mapping,
+            "private_ipv6": private_ipv6,
+            "identification_token": token,
+            "destination_constant_id": destination_constant_id,
+            "destination_var": destination_var,
+            "num_players": num_players,
+            "num_participants": num_participants,
+            "ip": ip,
+            "port": port,
+            "players": players,
+        }
+    except (IndexError, ValueError):
+        return None
+
+
+def _build_player_info(player_id, name, encoding=1):
+    player_id = bytes(player_id)
+    if len(player_id) != 16:
+        raise ValueError("Pia player id must be 16 bytes")
+    name = name.encode() if isinstance(name, str) else bytes(name)
+    if len(name) > 40:
+        raise ValueError("Pia player name is too long")
+    return player_id + len(name).to_bytes(4, "big") + bytes([encoding]) + name
+
+
+def _build_session_station(constant_id, variable_id, ip, port, station_index,
+                           join_order, token, num_players, num_participants, players):
+    token = bytes(token)
+    if len(token) != 32:
+        raise ValueError("Pia identification token must be 32 bytes")
+    out = bytearray(_constant_id8(constant_id))
+    out += (_vid(variable_id) & 0xFFFF).to_bytes(2, "big")
+    out += _ip4(ip) + (port & 0xFFFF).to_bytes(2, "big")
+    out += bytes([station_index & 0xFF])
+    out += (join_order & 0xFFFF).to_bytes(2, "big")
+    out += b"\x00\x00"                              # left-join order / reserved
+    out += token
+    out += bytes([num_players & 0xFF, num_participants & 0xFF])
+    out += b"\x00\x00"
+    for player in players:
+        out += _build_player_info(player["player_id"], player["name"], player["encoding"])
+    return bytes(out)
+
+
+def build_session_update(join, host_constant_id, host_var, host_ip, host_name,
+                         *, host_player_id=DEFAULT_PLAYER_ID, sequence_id=1):
+    """Build the leader's fragmented Session type-5 acceptance/update.
+
+    This is the two-station Pia 6.39 layout observed from the native FRLG
+    leader.  The outer seven-byte fragment header declares one fragment; the
+    body describes the leader first and the requesting station second.
+    """
+    if not join or not join.get("players"):
+        raise ValueError("a parsed Session join with at least one player is required")
+    host_constant_id = _constant_id8(host_constant_id)
+    host_var = _vid(host_var)
+    host_player = {"player_id": bytes(host_player_id), "name": host_name, "encoding": 1}
+    host_station = _build_session_station(
+        host_constant_id, host_var, host_ip, 12345, 0, 0, b"\x00" * 32, 1, 1,
+        [host_player])
+    guest_station = _build_session_station(
+        join["source_constant_id"], join["source_var"], join["ip"], join["port"], 1, 1,
+        join["identification_token"], join["num_players"], join["num_participants"],
+        join["players"])
+    # [type, unknown:u16, fragment-count, fragment-index, fragment-offset:u16]
+    out = bytearray.fromhex("05000001000003")
+    out += host_constant_id
+    out += host_var.to_bytes(2, "big")
+    out += bytes([2, 0])                            # two stations, no departed stations
+    out += (sequence_id & 0xFFFF).to_bytes(2, "big")
+    out += b"\x00" * 6                            # two documented + four 6.39 reserved bytes
+    out += host_station + guest_station
+    return bytes(out)
+
+
+def build_session_join_response(join, host_constant_id, host_var, random4):
+    """Build the leader's Session type-2 response for the first guest seat."""
+    random4 = bytes(random4)
+    if len(random4) != 4:
+        raise ValueError("Session join response random value must be four bytes")
+    versions = dict(join["protocols"])
+    session_version = versions.get(PROTO_SESSION, 7)
+    return (bytes([SESSION_JOIN_RESPONSE, PROTO_SESSION, session_version, 1])
+            + b"\x00" * 4 + random4
+            + _constant_id8(host_constant_id) + (_vid(host_var) & 0xFFFF).to_bytes(2, "big")
+            + _constant_id8(join["source_constant_id"])
+            + (join["source_var"] & 0xFFFF).to_bytes(2, "big")
+            + bytes([1]) + (1).to_bytes(2, "big") + b"\x00\x00")
 
 
 def parse_session(payload):

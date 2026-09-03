@@ -25,93 +25,42 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from frlgsim import crypto as cryptomod, mon as monmod, linkplayer, trade, sim as simmod  # noqa
+from frlgsim import config as configmod, crypto as cryptomod, trade, sim as simmod  # noqa
 from frlgsim import transport as tmod, linkstate as lsmod  # noqa: E402
 from frlgsim import barrier as lsmod_barrier, pia_connect  # noqa: E402
+from frlgsim import trade_runtime as runtime  # noqa: E402
 
 
-_START = time.monotonic()   # session origin for the elapsed-time stamp on every log line
-
-
-class _Log:
-    """Two-level console logger. Calling it prints a DETAIL line (only with --verbose); .info()
-    prints a clean, identifier-free MILESTONE line (only WITHOUT --verbose). So a default run
-    narrates the session's state changes with no personal data, while --verbose gives the full
-    wire-level trace. `prefix` is prepended to detail lines (the trade engine uses "  [trade]").
-    Every line is stamped with seconds since session start, so a pause between milestones (e.g. the
-    host taking its time to walk into the trade room) is visible as the gap between two stamps."""
-
-    def __init__(self, verbose, prefix=""):
-        self.verbose = verbose
-        self.prefix = prefix
-
-    def _ts(self):
-        return f"[{time.monotonic() - _START:7.1f}s]"
-
-    def __call__(self, *a):
-        if self.verbose:
-            print(self._ts(), self.prefix, *a) if self.prefix else print(self._ts(), *a)
-
-    def info(self, *a):
-        if not self.verbose:
-            print(self._ts(), *a)
-
-
-def parse_slots(spec, trades, party_len):
-    """--slots "a,b,c" -> a validated list of 0-based party indices (len==trades, distinct, in-range).
-    Returns None when spec is empty (the engine then derives the default from --slot)."""
-    if not spec:
-        return None
-    try:
-        slots = [int(s) for s in spec.split(",") if s != ""]
-    except ValueError:
-        raise SystemExit(f"--slots must be a comma list of integers, got {spec!r}")
-    if len(slots) != trades:
-        raise SystemExit(f"--slots must have {trades} entries (== --trades), got {len(slots)}")
-    if len(set(slots)) != len(slots):
-        raise SystemExit(f"--slots must be distinct (a slot can't be offered twice): {slots}")
-    if any(not 0 <= s < party_len for s in slots):
-        raise SystemExit(f"--slots must each be 0..{party_len - 1} (party size): {slots}")
-    return slots
-
-
-def make_engine(args, lg):
-    party = [monmod.Mon.from_file(p) for p in args.party]
-    for i, m in enumerate(party):
-        lg(f"  party slot {i}: {m.describe()}")
-    lg.info(f"Loaded {len(party)} party Pokémon (offering slot {args.slot + 1}).")
-    # Validate the trade count against the party: N distinct slots need N mons; a
-    # full-party swap (N=6) needs a full 6-mon party.
-    if args.trades > len(party):
-        raise SystemExit(f"--trades {args.trades} needs at least {args.trades} party mons "
-                         f"(distinct slot per round); supplied {len(party)}")
-    offered_slots = parse_slots(args.slots, args.trades, len(party))
-    lp = linkplayer.LinkPlayer(
-        name=args.ot,
-        version=linkplayer.VERSION_FIRE_RED if args.version == "firered"
-        else linkplayer.VERSION_LEAF_GREEN,
-    )
-    elog = _Log(lg.verbose, "  [trade]")   # engine detail lines get the "  [trade]" tag
+def make_engine(run_config, lg, *, default_anim_delay=None):
+    plan = run_config.plan
+    options = run_config.role
+    party = runtime.load_party(plan.party_paths, lg)
+    lg.info(f"Loaded {len(party)} party Pokémon (offering slot {plan.trade_slot + 1}).")
+    lp = run_config.profile.to_link_player()
+    elog = runtime.ConsoleLog(lg.verbose, "  [trade]", start=lg.start)
     # anim_delay None -> the engine uses DEFAULT_ANIM_FRAMES (the wire-measured wireless DoTradeAnim
     # duration); --anim-delay overrides it (mainly for fast offline replays).
-    eng = trade.TradeEngine(party, trade_slot=args.slot, link_player=lp, mpid=args.self_id,
-                            anim_delay=args.anim_delay, decline=args.decline,
-                            trades=args.trades, offered_slots=offered_slots,
-                            refuse_partner_deoxys_mew=args.refuse_illegit,
-                            trust_pia=args.trust_pia, log=elog)
+    anim_delay = plan.anim_delay if plan.anim_delay is not None else default_anim_delay
+    eng = trade.TradeEngine(
+        party, trade_slot=plan.trade_slot, link_player=lp, mpid=options.self_id,
+        anim_delay=anim_delay, decline=options.decline, trades=plan.trades,
+        offered_slots=plan.offered_slots,
+        refuse_partner_deoxys_mew=options.refuse_illegit,
+        trust_pia=plan.trust_pia, log=elog)
     lg(f"  seat=RIGHT (Follower / mpId={eng.mpid}); trades={eng.trades}, "
        f"offered_slots={eng.offered_slots}")
     return eng
 
 
-def run_live(args, lg):
-    lg(f"[live] scanning for FRLG LDN network (nickname={args.ot})...")
-    comm_id = int(args.comm_id, 16) if args.comm_id else None
-    password = bytes.fromhex(args.password) if args.password else None   # None -> built-in
-    t = tmod.LiveTransport(password=password, nickname=args.ot, keys_path=args.keys,
-                           local_comm_id=comm_id, phyname=args.phy, log=lg).start()
+def run_live(run_config, lg):
+    plan, ldn, options = run_config.plan, run_config.ldn, run_config.role
+    profile = run_config.profile
+    lg(f"[live] scanning for FRLG LDN network (nickname={profile.name})...")
+    t = tmod.LiveTransport(
+        password=ldn.password, nickname=profile.name, keys_path=ldn.keys_path,
+        local_comm_id=ldn.local_comm_id, phyname=ldn.phy, log=lg).start()
     pc = cryptomod.PiaCrypto(t.ssid)
-    engine = make_engine(args, lg)
+    engine = make_engine(run_config, lg)
     # Pia CONNECTION layer (S0): Net 0x11->0x12, Session(13) join, RTT keepalive. WITHOUT this the
     # host never registers us as a peer (no "OK"); the sim must NOT emit trade traffic or sit down
     # until the host confirms the connection [frlgsim/pia_connect.py; wiki Pia 6.32+]. The MACs are
@@ -122,31 +71,31 @@ def run_live(args, lg):
               f"the Session join may be rejected.")
     conn = pia_connect.ConnectionManager(
         our_mac=t.our_mac or b"\x00" * 6, host_mac=t.host_mac or b"\x00" * 6,
-        our_ip=t.our_ip, host_ip=t.host_ip, player_name=args.ot,
+        our_ip=t.our_ip, host_ip=t.host_ip, player_name=profile.name,
         random4=os.urandom(4), log=lg)
     # Held-keys overworld link-state engine: keepalive (0xBE00 EMPTY) every idle VBlank, sit at
     # the RIGHT seat (mpId 1), then cancel-to-leave after the configured trade(s). self_id is
     # asserted == 1 (the joiner / RIGHT seat) [frlgsim/linkstate.py; trade.c:1816].
-    lstate = lsmod.LinkState(self_id=args.self_id, log=lg)
+    lstate = lsmod.LinkState(self_id=options.self_id, log=lg)
     # emulator RFU connect id: our OWN 2-byte RFU connection id sent in the 'C' frame. Any nonzero
     # value works (the host does not match it, it just seats our slot), so we pick a random nonzero
     # one. A FRESH id per run also avoids the host's ~40s lost-id re-join lockout that reusing a value
     # would hit. --connect-id (alias --parent-pid) overrides for debugging.
-    if args.connect_id:
-        connect_id = bytes.fromhex(args.connect_id)
+    if options.connect_id:
+        connect_id = options.connect_id
     else:
         connect_id = (int.from_bytes(os.urandom(2), "big") or 1).to_bytes(2, "big")
     lg(f"[live] emulator connect: will send 'C' with connect id {connect_id.hex()} "
-          f"({'override' if args.connect_id else 'random nonzero'}); the host's 'A' (0x41) accept "
+          f"({'override' if options.connect_id else 'random nonzero'}); the host's 'A' (0x41) accept "
           f"seats our slot - the value need not match anything on the host.")
-    s = simmod.Sim(t, pc, engine, t.our_ip, t.host_ip, conn=conn, compress=args.compress,
-                   linkstate=lstate, connect_id=connect_id, capture_path=args.capture, log=lg)
-    if args.capture:
-        lg(f"[live] capturing every Pia datagram (both dirs) -> {args.capture} "
+    s = simmod.Sim(t, pc, engine, t.our_ip, t.host_ip, conn=conn, compress=options.compress,
+                   linkstate=lstate, connect_id=connect_id, capture_path=ldn.capture_path, log=lg)
+    if ldn.capture_path:
+        lg(f"[live] capturing every Pia datagram (both dirs) -> {ldn.capture_path} "
               f"(decrypt/analyse offline afterward)")
     lg(f"[live] joined LDN; awaiting the host's Pia connection handshake "
           f"(Net 0x11 -> Session join -> confirm). NOT trading until the host confirms us.")
-    lg(f"[live] configured trades={args.trades} (cancel-to-leave after the final trade)")
+    lg(f"[live] configured trades={plan.trades} (cancel-to-leave after the final trade)")
     period = 1.0 / 59.727
     # Sit at the RIGHT seat once the link is ESTABLISHED so our slot reaches PLAYER_LINK_STATE_READY
     # and the host's seat barrier (GetCableClubPartnersReady) can clear [overworld.c:2989-3000].
@@ -319,18 +268,17 @@ def run_live(args, lg):
     return engine
 
 
-def run_replay(args, lg):
-    print(f"[replay] feeding host IN stream from {args.replay} through the RX stack...")
-    t = tmod.ReplayTransport.from_capture(args.replay)
+def run_replay(run_config, lg):
+    replay_path = run_config.role.replay_path
+    print(f"[replay] feeding host IN stream from {replay_path} through the RX stack...")
+    t = tmod.ReplayTransport.from_capture(replay_path)
     if not t.ssid:
         sys.exit("capture has no SSID (predates SSID logging) - cannot decrypt")
     pc = cryptomod.PiaCrypto(t.ssid)
     # the capture has a finite frame budget; the realistic 1935-frame anim would outlast it, so use
     # a small anim_delay for replay unless the user explicitly set --anim-delay. The early-arrival
     # guard keeps READY_FINISH before commit regardless of the value.
-    if args.anim_delay is None:
-        args.anim_delay = 5
-    engine = make_engine(args, lg)
+    engine = make_engine(run_config, lg, default_anim_delay=5)
     s = simmod.Sim(t, pc, engine, t.our_ip, t.host_ip, log=lg)
     while not t.drained and not engine.done:
         s.tick()
@@ -342,7 +290,7 @@ def run_replay(args, lg):
     return engine
 
 
-def main():
+def build_parser():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("party", nargs="+", metavar="MON",
@@ -368,8 +316,7 @@ def main():
     ap.add_argument("--self-id", type=int, default=1, choices=(1,),
                     help="wire mpId / gLocalLinkPlayerId (joiner = 1 = RIGHT seat; the only valid "
                          "value - mpId 0 is the host/parent) [trade.c:1816; link_rfu_2.c:1633-1638]")
-    ap.add_argument("--ot", default="EMU", help="sim trainer / OT name (LinkPlayer)")
-    ap.add_argument("--version", choices=("firered", "leafgreen"), default="leafgreen")
+    configmod.add_identity_arguments(ap)
     ap.add_argument("--anim-delay", type=int, default=None,
                     help="frames to wait after START_TRADE before READY_FINISH "
                          f"(default {trade.DEFAULT_ANIM_FRAMES}, the wire-measured wireless "
@@ -406,9 +353,52 @@ def main():
     ap.add_argument("--capture", metavar="FILE", help="(live) record EVERY Pia datagram both "
                     "directions to a .jsonl (incl. the SSID), so a live attempt can be "
                     "decrypted/analysed offline")
-    args = ap.parse_args()
-    if not 1 <= len(args.party) <= 6:
-        ap.error(f"supply 1..6 party mons (gPlayerParty slots 0..5); got {len(args.party)}")
+    return ap
+
+
+def _hex_bytes(ap, option, value, *, size=None):
+    if not value:
+        return None
+    try:
+        result = bytes.fromhex(value)
+    except ValueError:
+        ap.error(f"{option} must contain hexadecimal bytes")
+    if size is not None and len(result) != size:
+        ap.error(f"{option} must contain exactly {size} bytes")
+    return result
+
+
+def _build_run_config(ap, args):
+    try:
+        offered_slots = runtime.parse_slots(args.slots, args.trades, len(args.party))
+        profile = configmod.profile_from_overrides(
+            ot=args.ot, version=args.version, trainer_id=args.id)
+        plan = configmod.TradePlan(
+            party_paths=tuple(args.party), output_path=args.out,
+            output_size=args.out_size, output_format=args.out_format,
+            trade_slot=args.slot,
+            offered_slots=None if offered_slots is None else tuple(offered_slots),
+            trades=args.trades, anim_delay=args.anim_delay,
+            trust_pia=args.trust_pia)
+        ldn = configmod.LdnConfig(
+            password=_hex_bytes(ap, "--password", args.password),
+            phy=args.phy, keys_path=args.keys,
+            local_comm_id=int(args.comm_id, 16) if args.comm_id else None,
+            capture_path=args.capture)
+        role = configmod.JoinerOptions(
+            live=args.live, replay_path=args.replay,
+            self_id=args.self_id, decline=args.decline,
+            refuse_illegit=args.refuse_illegit, compress=args.compress,
+            connect_id=_hex_bytes(ap, "--connect-id", args.connect_id, size=2))
+        return configmod.TradeRunConfig(profile, plan, ldn, role)
+    except ValueError as exc:
+        ap.error(str(exc))
+
+
+def main(argv=None):
+    ap = build_parser()
+    args = ap.parse_args(argv)
+    run_config = _build_run_config(ap, args)
     # The host's Pia messages are zstd-compressed; without zstandard in THIS interpreter every
     # received message is unparseable and the sim silently never responds (tx stays 0). Fail loudly.
     if not cryptomod.HAVE_ZSTD:
@@ -417,10 +407,10 @@ def main():
                  f"message and will never reply. Install it into THIS interpreter:\n"
                  f"    {sys.executable} -m pip install zstandard")
 
-    lg = _Log(args.verbose)
-    engine = run_live(args, lg) if args.live else run_replay(args, lg)
+    lg = runtime.ConsoleLog(args.verbose)
+    engine = run_live(run_config, lg) if args.live else run_replay(run_config, lg)
 
-    saved = save_received(engine, args, lg)
+    saved = save_received(engine, run_config, lg)
     if not saved and args.live:
         print("\nTrade did not complete (no mon received).")
     # success: a mon was saved, or this was an offline replay (which exercises the path even if the
@@ -428,34 +418,15 @@ def main():
     return 0 if (saved or args.replay) else 1
 
 
-def save_received(engine, args, lg):
+def save_received(engine, run_config, lg):
     """Save each received mon. trades==1 keeps the exact legacy single-file
     behavior (named by --out). trades>1 saves each as <stem>_trade<k>_<species>.pk3. Returns the
     number of mons saved."""
     mons = engine.received_mons or ([engine.received_mon] if engine.received_mon else [])
-    if not mons:
-        return 0
-    ext = args.out_format
-    if args.trades == 1:
-        m = mons[0]
-        saver = m.save_ek3 if ext == "ek3" else m.save_pk3
-        saver(args.out, size=args.out_size)
-        lg(f"\nReceived: {m.describe()}")
-        lg.info(f"Received: {m.species_name} (#{m.species})")
-        print(f"Saved -> {args.out} ({ext}, {args.out_size}B)")
-        return 1
-    stem, _ = os.path.splitext(args.out)
-    lg(f"\nReceived {len(mons)} mon(s) over {args.trades} trade(s):")
-    lg.info(f"Received {len(mons)} mon(s) over {args.trades} trade(s):")
-    for k, m in enumerate(mons, start=1):
-        sp = "".join(c for c in m.species_name if c.isalnum()) or f"sp{m.species}"
-        path = f"{stem}_trade{k}_{sp}.{ext}"
-        saver = m.save_ek3 if ext == "ek3" else m.save_pk3
-        saver(path, size=args.out_size)
-        lg(f"  trade {k}: {m.describe()}")
-        lg.info(f"  trade {k}: {m.species_name} (#{m.species})")
-        print(f"    saved -> {path} ({ext}, {args.out_size}B)")
-    return len(mons)
+    plan = run_config.plan
+    return runtime.save_received_mons(
+        mons, output_path=plan.output_path, output_size=plan.output_size,
+        output_format=plan.output_format, trades=plan.trades, log=lg)
 
 
 if __name__ == "__main__":

@@ -91,6 +91,54 @@ def _ni_header(data_type, payload_size, data_size):
             + (data_size & 0xFFFFFFFF).to_bytes(4, "little"))
 
 
+def _ni_send_sequence(src, data_type, payload_size):
+    """Faithful single-pass of the librfu NI sender state machine [rfu_STC_setSendData_org +
+    rfu_STC_NI_constructLLSF + rfu_STC_NI_receive_Sender], returning the ordered list of sub-frames
+    as (state, n, phase, size, payload) tuples - LLSF-agnostic (works for CHILD or PARENT; the caller
+    wraps each tuple in the mode-appropriate LLSF header). `payload_size = subFrameSize - frameSize`.
+
+    Reproduces the SEND_START -> SENDING -> SEND_LAST -> SEND_NULL walk. The 7-byte NI header
+    (dataType, payloadSize, dataSize) is chunked over one-or-more NI_START frames in `payload_size`
+    units at phase 0 (n = 1,2,3,... per frame); the parent status (payloadSize 5 < 7) needs TWO
+    NI_STARTs, the child game data (payloadSize 12 >= 7) needs one. Then SENDING windows `src` over
+    WINDOW_COUNT phases. Verified: _ni_send_sequence(childGameData, 1, 12) reproduces the byte-exact
+    child NISender output, and _ni_send_sequence(status, 0, 5) matches the recv-ack capture below."""
+    src = bytes(src)
+    data_size = len(src)
+    header = _ni_header(data_type, payload_size, data_size)
+    seq = []
+    # SLOT_STATE_SEND_START: send the 7-byte header, `payload_size` bytes/frame, all at phase 0.
+    # remainSize starts at 7 and is decremented by payload_size per ACK [receive_Sender:2132]; the
+    # header is done once remainSize hits 0 or underflows (the C's `default`/`case 0`), then -> SENDING.
+    n0, off, remain = 1, 0, NI_HEADER_SIZE
+    while True:
+        size = min(remain, payload_size)
+        seq.append((rfu.LCOM_NI_START, n0, 0, size, header[off:off + size]))
+        n0 = (n0 + 1) & 3
+        off += payload_size
+        remain -= payload_size
+        if remain <= 0:
+            break
+    # SLOT_STATE_SENDING: window src over WINDOW_COUNT phases, payload_size bytes each, phase-round-robin
+    # skipping phases whose window is past the end of src [constructLLSF:1818]. n resets to 1 per phase.
+    now = [payload_size * i for i in range(WINDOW_COUNT)]
+    n = [1] * WINDOW_COUNT
+    phase, remain = 0, data_size
+    while remain > 0:
+        while now[phase] >= data_size:
+            phase = (phase + 1) % WINDOW_COUNT
+        o = now[phase]
+        size = min(payload_size, data_size - o)
+        seq.append((rfu.LCOM_NI, n[phase], phase, size, src[o:o + size]))
+        now[phase] += payload_size << 2            # SENDING stride = payloadSize<<2 [receive_Sender:2131]
+        n[phase] = (n[phase] + 1) & 3
+        phase = (phase + 1) % WINDOW_COUNT
+        remain -= payload_size
+    seq.append((rfu.LCOM_NI_END, 0, 0, 0, b""))    # SLOT_STATE_SEND_LAST: n=0, size=0
+    seq.append((rfu.LCOM_NULL, 1, 0, 0, b""))      # SLOT_STATE_SEND_NULL: n=1, size=0
+    return seq
+
+
 class NISender:
     """Single-pass CHILD NI sender. next_slot() returns the next NI sub-frame SLOT bytes (LLSF + the
     sub-frame payload), or None once the whole NI transfer is finished (the machine reached
@@ -167,6 +215,50 @@ class NISender:
         return None
 
 
+class ParentNISender:
+    """Single-pass PARENT NI sender - the HOST's side of the NI handshake, delivering the 1-byte join
+    STATUS to the child right after acking the child's game-data NI [SendRfuStatusToPartner ->
+    rfu_NI_setSendData(1 << idx, 8, &status, 1), link_rfu_2.c:1747]. MODE_PARENT: frameSize 3,
+    subFrameSize 8 => payloadSize 5; dataType 0 (rfu_STC_setSendData_org sending-path sets dataType=0).
+
+    Because payloadSize 5 < the 7-byte NI header, SEND_START emits TWO NI_STARTs. Verified byte-exact
+    vs the child's recv-ack capture in recv_ack_slot()'s docstring (the child acked NI_START n=1,
+    NI_START n=2, NI n=1, NI_END n=0 - exactly the (state,n,phase) this sender emits):
+
+        NI_START n=1 ph0 sz5  <hdr[0:5] = dataType 0, payloadSize 5, dataSize 1 (low bytes)>
+        NI_START n=2 ph0 sz2  <hdr[5:7] = dataSize high bytes>
+        NI       n=1 ph0 sz1  <status byte (5)>
+        NI_END   n=0 ph0 sz0
+        NULL     n=1 ph0 sz0
+
+    next_slot() returns the next PARENT NI sub-frame SLOT (3-byte PARENT LLSF + payload) or None when
+    finished; the orchestrator wraps each in a HOST 'T' frame via gbaframe.wrap_t_parent, one/VBlank."""
+
+    STATUS_SUBFRAME_SIZE = 8            # rfu_NI_setSendData(1 << idx, 8, &status, 1) [link_rfu_2.c:1747]
+
+    def __init__(self, status=RFU_STATUS_JOIN_GROUP_OK, bm_slot=1, sub_frame_size=STATUS_SUBFRAME_SIZE):
+        """`status` = the 1-byte join status the child reads (RFU_STATUS_JOIN_GROUP_OK=5 accepts it;
+        any other value rejects). `bm_slot` = the connected-child slot bitmask (1 for RFU slot 0)."""
+        self.status = status & 0xFF
+        self.bm_slot = bm_slot
+        payload_size = sub_frame_size - rfu.PARENT_FRAME_SIZE       # 8 - 3 = 5
+        # dataType 0 (user data): the sending path of setSendData_org sets dataType=0 [librfu_rfu.c:1477].
+        self._seq = _ni_send_sequence(bytes([self.status]), data_type=0, payload_size=payload_size)
+        self._i = 0
+
+    @property
+    def done(self):
+        return self._i >= len(self._seq)
+
+    def next_slot(self):
+        """Advance one sub-frame; return its PARENT slot bytes (ack=0) or None when the NI send done."""
+        if self.done:
+            return None
+        state, n, phase, size, payload = self._seq[self._i]
+        self._i += 1
+        return rfu.parent_ni_llsf(state, n, phase, 0, size, self.bm_slot) + bytes(payload)
+
+
 def recv_ack_slot(state, n, phase):
     """Build the CHILD's RECV-side NI ACK slot for a received HOST NI sub-frame: MIRROR the host
     frame's (state, n, phase) with ack=1, size=0, NO payload [rfu_STC_NI_receive ack path].
@@ -218,3 +310,100 @@ class NIReceiver:
         if state in (rfu.LCOM_NI_START, rfu.LCOM_NI, rfu.LCOM_NI_END):
             return recv_ack_slot(state, ni_rec["n"], ni_rec["phase"])
         return None
+
+
+# --- PARENT recv path: ACK the child's game-data NI and reassemble its 26-byte RfuGameData ----------
+def parent_recv_ack_slot(state, n, phase, bm_slot=1):
+    """The HOST's RECV-side NI ACK slot for a received CHILD NI sub-frame: MIRROR the child frame's
+    (state, n, phase) with ack=1, size=0, in a 3-byte PARENT LLSF [rfu_STC_NI_constructLLSF on the
+    recv NIComm, MODE_PARENT]. Parent counterpart of recv_ack_slot()."""
+    return rfu.parent_ni_llsf(state, n, phase, 1, 0, bm_slot)
+
+
+def decode_child_ni_slot(slot):
+    """Decode a CHILD NI sub-frame SLOT (2-byte CHILD LLSF + payload) into the same dict shape
+    gbaframe.parse_in attaches as record['ni'] ({state, ack, n, phase, size, payload}) - so
+    ParentNIReceiver.on_child_ni() consumes the console-child's NI frames symmetrically to how the
+    child's NIReceiver consumes the host's. `slot` = the child's LLSF+payload (LLSF stripped of the
+    'T'-frame wrapper)."""
+    llsf = rfu.parse_llsf_child(slot)
+    return {"state": llsf["state"], "ack": llsf["ack"], "n": llsf["n"], "phase": llsf["phase"],
+            "size": llsf["size"], "payload": bytes(slot[2:2 + llsf["size"]])}
+
+
+class ParentNIReceiver:
+    """The HOST's NI RECEIVER: ACKs the child's outgoing game-data NI sub-frames and reassembles the
+    26-byte RfuGameData (serialNo + gname + uname) the child delivers via
+    rfu_NI_CHILD_setSendGameName (dataType 1, payloadSize 12). The mirror of the child's NIReceiver.
+
+    The child's NI send is NI_START(header) then NI frames windowed over phases (ph0=src[0:12],
+    ph1=src[12:24], ph2=src[24:26]) then NI_END then NULL. on_child_ni() returns the PARENT recv-NI
+    ack slot (mirror state/n/phase, ack=1, sz=0) for each NI_START/NI/NI_END with ack=0, reassembles
+    the payload by phase, marks `complete` on the child's NI_END (defensively also on NULL), and
+    exposes `game_data` (the raw 26 bytes), `trainer_id`, and `uname` for the Pia partner list /
+    reconnect match (link_rfu_2.c:2761). The child's terminal NULL is NOT acked (symmetric with the
+    child's own recv path)."""
+
+    def __init__(self, bm_slot=1, payload_size=12):
+        self.complete = False
+        self.bm_slot = bm_slot
+        self.payload_size = payload_size          # refined from the NI_START header when it arrives
+        self.data_type = None
+        self.data_size = None
+        self.game_data = None
+        self._hdr = bytearray()
+        self._buf = bytearray()
+        self._phase_count = [0] * WINDOW_COUNT
+
+    def on_child_ni(self, ni_rec):
+        """`ni_rec` = a child NI record ({state, ack, n, phase, size, payload}, from decode_child_ni_slot
+        or parse_in). Returns the PARENT recv-NI ack slot for a child NI_START/NI/NI_END with ack=0,
+        else None (ack=1 frames are the child acking OUR ParentNISender; a child NULL only terminates)."""
+        if ni_rec is None or ni_rec.get("ack") != 0:
+            return None                           # only the child's OUTGOING NI data (ack=0) is ack-able
+        state = ni_rec["state"]
+        if state == rfu.LCOM_NI_START:
+            self._hdr += ni_rec.get("payload", b"")
+            if self.data_size is None and len(self._hdr) >= NI_HEADER_SIZE:
+                self.data_type = self._hdr[0]
+                self.payload_size = int.from_bytes(self._hdr[1:3], "little") or self.payload_size
+                self.data_size = int.from_bytes(self._hdr[3:7], "little")
+        elif state == rfu.LCOM_NI:
+            phase = ni_rec["phase"] & 3
+            off = phase * self.payload_size + self._phase_count[phase] * WINDOW_COUNT * self.payload_size
+            payload = ni_rec.get("payload", b"")
+            if off + len(payload) > len(self._buf):
+                self._buf.extend(b"\x00" * (off + len(payload) - len(self._buf)))
+            self._buf[off:off + len(payload)] = payload
+            self._phase_count[phase] += 1
+        elif state == rfu.LCOM_NULL:              # child terminator: completes the transfer, NOT acked
+            self.complete = True
+            self._finalize()
+            return None
+        if state == rfu.LCOM_NI_END:              # last child NI sub-frame: ack it AND mark complete
+            self.complete = True
+            self._finalize()
+        if state in (rfu.LCOM_NI_START, rfu.LCOM_NI, rfu.LCOM_NI_END):
+            return parent_recv_ack_slot(state, ni_rec["n"], ni_rec["phase"], self.bm_slot)
+        return None
+
+    def _finalize(self):
+        if self.game_data is None:
+            data = bytes(self._buf)
+            if self.data_size is not None:
+                data = data[:self.data_size]
+            self.game_data = data
+
+    @property
+    def trainer_id(self):
+        """compatibility.playerTrainerId - gname[2:4] = game_data[4:6] LE [build_game_data / link_rfu.h]."""
+        if not self.game_data or len(self.game_data) < 6:
+            return None
+        return int.from_bytes(self.game_data[4:6], "little")
+
+    @property
+    def uname(self):
+        """The child's OT name (uname[9]) = game_data[17:26], game-charset, 0-padded [build_game_data]."""
+        if not self.game_data or len(self.game_data) < 26:
+            return None
+        return bytes(self.game_data[17:26])

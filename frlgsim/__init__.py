@@ -1,9 +1,8 @@
-"""frlgsim - a Pokémon FireRed/LeafGreen JOINER trade simulator over the LDN bridge.
+"""FireRed/LeafGreen trade protocol models for both LDN joiner and host roles.
 
-A Pia client that joins a real FRLG console's link session and performs a full trade,
-imitating the wireless CHILD (RFU MODE_CHILD, GBA mpId=1, trade.c "Follower"). The on-wire
-behaviour is specified module-by-module; every module here cites the relevant decomp
-`file.c:line` it implements.
+The original stack joins a real console as the wireless RFU child.  The host stack composes
+``HostPeerProtocol`` (Pia), ``HostSession`` (Reliable/RFU), and ``HostTradeEngine`` (game state) to
+act as the leader.  Both roles share the byte-level Pokémon, block, and framing models.
 
 Layer stack (bottom-up), one per-VBlank RFU command slot becomes:
     14-byte RFU slot (rfu.py)
@@ -31,4 +30,8 @@ held-keys READY by linkstate.py, P4/P5 handoff into the trade FSM. It is one-sho
 re-fires on trades 2..6) [src/union_room.c:1753-1933; src/cable_club.c:827-942].
 """
 
-__all__ = ["crypto", "mon", "rfu", "gbaframe", "reliable", "charmap", "linkstate", "barrier"]
+__all__ = [
+    "barrier", "charmap", "config", "crypto", "gbaframe", "host_app", "host_beacon",
+    "host_pia", "host_session", "host_support", "host_trade", "linkstate", "mon",
+    "reliable", "rfu", "rfu_leader", "trade_runtime",
+]

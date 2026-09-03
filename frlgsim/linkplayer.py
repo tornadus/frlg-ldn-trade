@@ -23,6 +23,7 @@ VERSION_FIRE_RED = 0x4004                        # gGameVersion(4) + 0x4000
 VERSION_LEAF_GREEN = 0x4005                      # gGameVersion(5) + 0x4000
 LANGUAGE_ENGLISH = 2
 LP_FIELD2 = 0x8000                               # gLocalLinkPlayer.lp_field_2
+HOST_NAME_PAD = 0xFF                             # robust host-role fixed-field terminators
 
 LINK_PLAYER_SIZE = 28
 LINK_PLAYER_BLOCK_SIZE = 60
@@ -46,11 +47,19 @@ class LinkPlayer:
     player_id: int = 0
     language: int = LANGUAGE_ENGLISH
 
-    def pack(self):
+    def pack(self, *, name_pad=0x00):
+        """Serialize the 28-byte structure.
+
+        ``name_pad`` controls bytes after the mandatory 0xFF string terminator.
+        Native zero-initialized LinkPlayer storage normally leaves them as
+        zero.  A peer may safely use 0xFF instead: every byte is then a valid
+        Gen III end-of-string marker, which is useful for a host crossing an
+        RFU bridge where the fixed-width name is consumed by several UI paths.
+        """
         return (self.version.to_bytes(2, "little")
                 + self.field2.to_bytes(2, "little")
                 + (self.trainer_id & 0xFFFFFFFF).to_bytes(4, "little")
-                + charmap.encode(self.name, width=8, pad=0x00)        # 0xFF term, 0x00 pad
+                + charmap.encode(self.name, width=8, pad=name_pad)
                 + bytes([self.progress_flags & 0xFF, self.never_read & 0xFF,
                          self.progress_flags_copy & 0xFF, self.gender & 0xFF])
                 + (self.link_type & 0xFFFFFFFF).to_bytes(4, "little")
@@ -71,9 +80,9 @@ class LinkPlayer:
         )
 
 
-def build_block(link_player):
+def build_block(link_player, *, name_pad=0x00):
     """LinkPlayer -> 60-byte LinkPlayerBlock (both GameFreak magics)."""
-    blk = GAMEFREAK_MAGIC + link_player.pack() + GAMEFREAK_MAGIC
+    blk = GAMEFREAK_MAGIC + link_player.pack(name_pad=name_pad) + GAMEFREAK_MAGIC
     assert len(blk) == LINK_PLAYER_BLOCK_SIZE
     return blk
 
@@ -104,7 +113,7 @@ TC_OFF_MON_SPECIES = 0x54               # TrainerCard.monSpecies[PARTY_SIZE] (u1
 TC_OFF_WONDER_CARD = TRAINER_CARD_SIZE   # u16 written by CreateTrainerCardInBuffer @ offset 96
 
 
-def build_trainer_card(link_player, wonder_card_id=0, mon_species=None):
+def build_trainer_card(link_player, wonder_card_id=0, mon_species=None, *, name_pad=0x00):
     """Build the 100-byte BLOCK_REQ_SIZE_100 trainer-card buffer the host pulls in Task_ExchangeCards
     [union_room.c:1753-1789,1863-1870]. Reuses the LinkPlayer's OT name / trainerId / version so the
     card matches the LinkPlayerBlock identity (the host's CopyTrainerCardData expects them aligned).
@@ -117,7 +126,7 @@ def build_trainer_card(link_player, wonder_card_id=0, mon_species=None):
     card[TC_OFF_TRAINER_ID:TC_OFF_TRAINER_ID + 2] = \
         (link_player.trainer_id & 0xFFFF).to_bytes(2, "little")
     card[TC_OFF_PLAYER_NAME:TC_OFF_PLAYER_NAME + 8] = \
-        charmap.encode(link_player.name, width=8, pad=0x00)
+        charmap.encode(link_player.name, width=8, pad=name_pad)
     # TrainerCard.version is a u8 = gGameVersion (VERSION_FIRE_RED/LEAF_GREEN low byte), NOT the
     # 0x4000-tagged LinkPlayer.version field [trainer_card.c sets card->version = gameVersion].
     card[TC_OFF_VERSION] = link_player.version & 0xFF

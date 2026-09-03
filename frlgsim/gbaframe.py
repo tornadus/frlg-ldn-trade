@@ -56,6 +56,33 @@ def wrap_t(slot, ts):
     return bytes([GBA_MARKER, TYPE_T]) + len(body).to_bytes(2, "little") + body
 
 
+def wrap_t_parent(slot, ts):
+    """Build a HOST/parent 'T' (0x54) frame (the inverse of parse_in's 'T' branch) — used when the
+    SIM is the parent/leader and the console is the child. PARENT body layout puts slot_len at
+    body[4] (off-by-one vs the child's body[5]):
+        57 54 <body_len:u16 LE> | <ts:u32 LE> <slot_len:u8 @body[4]> 00 00 00 | <slot, pad mult-4>
+    `slot` already includes its 3-byte PARENT LLSF (rfu.parent_uni_slot / rfu.parent_ni_llsf+payload).
+    `ts` is the parent's per-frame counter (increases per NEW frame; reused on a Pia retransmit)."""
+    slot = bytes(slot)
+    padded = slot + b"\x00" * (_roundup4(len(slot)) - len(slot))
+    body = (ts & 0xFFFFFFFF).to_bytes(4, "little") + bytes([len(slot) & 0xFF, 0, 0, 0]) + padded
+    return bytes([GBA_MARKER, TYPE_T]) + len(body).to_bytes(2, "little") + body
+
+
+def build_accept(host_session_id, connect_id):
+    """The host's 'A' (0x41) accept of the child's 'C' connect [inverse of parse_in's 'A' branch].
+    Body = <host_session_id:2><echoed connect_id:2><00 00>. `host_session_id` is the parent's own
+    2-byte RFU session id; `connect_id` is the child's self-chosen id from its 'C' frame, echoed back."""
+    hsid = bytes(host_session_id)[:2].ljust(2, b"\x00")
+    cid = bytes(connect_id)[:2].ljust(2, b"\x00")
+    return build_gba_frame(TYPE_A, hsid + cid + b"\x00\x00")
+
+
+def build_disconnect(connect_id):
+    """The host's 'D' (0x44) disconnect: 57 44 02 00 <connect_id> (the child's echoed id)."""
+    return build_gba_frame(TYPE_D, bytes(connect_id)[:2].ljust(2, b"\x00"))
+
+
 def build_k(k_seq, mid, acked_ts):
     """Build a 'K' (0x4b) emulator ack frame [reference capture, verified]: 57 4b 0c 00 <k_seq:u32><mid:u32>
     <acked_host_ts:u32> (all LE). One per UNIQUE host 'T' ts; k_seq is joiner-global (+1 from 1);

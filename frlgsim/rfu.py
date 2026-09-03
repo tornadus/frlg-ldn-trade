@@ -50,6 +50,50 @@ def uni_slot(cmd14):
     return llsf.to_bytes(2, "little") + cmd
 
 
+# PARENT LLSF field shifts/masks [llsf_struct[MODE_PARENT], librfu_rfu.c:95-110]: frameSize=3 (a
+# 3-byte LE header), state<<14, ack<<13, n<<11, phase<<9, connSlotFlag(bmSlot)<<18, recvFirst<<22,
+# size in the low 7 bits (framesMask 0x7f).
+PARENT_LLSF_ACK_SHIFT, PARENT_LLSF_N_SHIFT = 13, 11
+PARENT_LLSF_PHASE_SHIFT, PARENT_LLSF_BMSLOT_SHIFT = 9, 18
+PARENT_FRAME_SIZE = 3
+COMM_TABLE_LENGTH = 70          # gRfu.recvCmds[5][7][2] = 5 rows x 14 bytes, the parent UNI payload
+
+
+def _parent_llsf(state, size, *, ack=0, n=0, phase=0, bm_slot=1):
+    """Build a 3-byte PARENT LLSF header (LE) [rfu_STC_*_constructLLSF, MODE_PARENT branch,
+    librfu_rfu.c:1843-1852,1884-1890]. For UNI only state+size(+bmSlot) are set; NI adds ack/n/phase."""
+    frame = ((state & 0xF) << PARENT_LLSF_STATE_SHIFT) | ((ack & 1) << PARENT_LLSF_ACK_SHIFT) \
+        | ((n & 3) << PARENT_LLSF_N_SHIFT) | ((phase & 3) << PARENT_LLSF_PHASE_SHIFT) \
+        | ((bm_slot & 0xF) << PARENT_LLSF_BMSLOT_SHIFT) | (size & 0x7F)
+    return (frame & 0xFFFFFF).to_bytes(PARENT_FRAME_SIZE, "little")
+
+
+def parent_uni_slot(recv_cmds, bm_slot=1):
+    """Wrap the parent's 70-byte gRecvCmds echo table in a PARENT UNI sub-frame [InitParentSendData
+    -> rfu_UNI_setSendData(acceptSlot, gRfu.recvCmds, 70), rfu_STC_UNI_constructLLSF]: a 3-byte LLSF
+    (LCOM_UNI<<14 | payloadSize | bmSlot<<18) then the table. `bm_slot` = the connected-child slot
+    bitmask (1 for a single child in RFU slot 0). This is broadcast every frame while linked."""
+    payload = bytes(recv_cmds).ljust(COMM_TABLE_LENGTH, b"\x00")[:COMM_TABLE_LENGTH]
+    return _parent_llsf(LCOM_UNI, len(payload), bm_slot=bm_slot) + payload
+
+
+def parent_ni_llsf(state, n, phase, ack, size, bm_slot=1):
+    """Build a PARENT NI sub-frame LLSF header (3-byte LE) — the parent's side of the NI handshake
+    (delivering the 1-byte join status, rfu_NI_setSendData). Mirrors child_ni_llsf but MODE_PARENT."""
+    return _parent_llsf(state, size, ack=ack, n=n, phase=phase, bm_slot=bm_slot)
+
+
+def pack_recv_cmds(rows):
+    """Pack up to 5 player rows (each a 14-byte gSendCmd slot, or b"" for an empty row) into the
+    70-byte gRecvCmds table. Row 0 = the parent's own gSendCmd; row 1 = the child (player 1);
+    rows 2-4 zero for a 2-player link [ReadAllPlayerRecvCmds, link_rfu_2.c:743]."""
+    out = bytearray(COMM_TABLE_LENGTH)
+    for i, row in enumerate(rows[:5]):
+        r = bytes(row)[:COMM_SLOT_LENGTH]
+        out[i * COMM_SLOT_LENGTH:i * COMM_SLOT_LENGTH + len(r)] = r
+    return bytes(out)
+
+
 def child_ni_llsf(state, n, phase, ack, size):
     """Build a CHILD NI link-layer sub-frame header (2-byte LE) [rfu_STC_NI_constructLLSF,
     librfu_rfu.c:1843]: (state&0xF)<<10 | ack<<9 | n<<7 | phase<<5 | size."""
@@ -96,6 +140,27 @@ def send_block_words(index, chunk12):
 
 def held_keys_words(keycode=0):
     return [SEND_HELD_KEYS, keycode & 0xFFFF, 0, 0, 0, 0, 0]
+
+
+BLOCK_REQ_SIZE_NONE = 0         # blockRequestType for the player-exchange block req [link.c BLOCK_REQ_*]
+
+
+def send_player_ids_words(link_player_idx=(1, 0, 0, 0), player_count=2):
+    """PARENT SEND_PLAYER_IDS (0x7700) slot words [RfuPrepareSendBuffer, link_rfu_2.c:1298-1305]:
+    w0=0x7700, w1=playerCount, then buff=(u8*)&gSendCmd[2] holds linkPlayerIdx[0..3]. A single child
+    in RFU slot 0 gets linkPlayerIdx=[1,0,0,0] (baseId 1, link_rfu_2.c:388), so the child reads its
+    mpId=linkPlayerIdx[childSlot=0]=1 (LoadLinkPlayerIds), matching MysteryGiftClient_Init(1,0)."""
+    idx = list(link_player_idx)[:4] + [0] * (4 - len(link_player_idx))
+    w2 = (idx[0] & 0xFF) | ((idx[1] & 0xFF) << 8)
+    w3 = (idx[2] & 0xFF) | ((idx[3] & 0xFF) << 8)
+    return [SEND_PLAYER_IDS, player_count & 0xFFFF, w2, w3, 0, 0, 0]
+
+
+def send_block_req_words(reqtype=BLOCK_REQ_SIZE_NONE):
+    """PARENT SEND_BLOCK_REQ (0xA100) slot words [RfuPrepareSendBuffer, link_rfu_2.c:1294-1296]:
+    w0=0xA100, w1=blockRequestType. reqtype NONE(0) makes both sides Rfu_InitBlockSend(...,200) so
+    each block-sends its 60-byte LinkPlayerBlock during the player exchange (link_rfu_2.c:1172)."""
+    return [SEND_BLOCK_REQ, reqtype & 0xFFFF, 0, 0, 0, 0, 0]
 
 
 def exit_standby_words(count):

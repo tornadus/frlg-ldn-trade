@@ -13,6 +13,8 @@ LiveTransport   - LIVE. Joins the FRLG console's LDN session with kinnay's `ldn`
 """
 
 import json
+import os
+import shutil
 import socket
 import struct
 import subprocess
@@ -121,8 +123,12 @@ def _run(cmd):
     subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+# iw lives in /usr/sbin, which is not on every user's PATH.
+IW = shutil.which("iw") or "/usr/sbin/iw"
+
+
 def _iw_del(iface):
-    _run(["iw", "dev", iface, "del"])
+    _run([IW, "dev", iface, "del"])
 
 
 def _sysctl(key, val):
@@ -133,7 +139,7 @@ def list_phy_ifaces():
     """Map phyName -> [netdev names] by parsing `iw dev`."""
     mapping, current = {}, None
     try:
-        out = subprocess.check_output(["iw", "dev"], text=True, stderr=subprocess.DEVNULL)
+        out = subprocess.check_output([IW, "dev"], text=True, stderr=subprocess.DEVNULL)
     except Exception:
         return mapping
     for raw in out.splitlines():
@@ -146,10 +152,37 @@ def list_phy_ifaces():
     return mapping
 
 
+def _read(path):
+    try:
+        with open(path) as f:
+            return f.read().strip().lower()
+    except OSError:
+        return None
+
+
+def _is_base_iface(phy, iface):
+    """True for the adapter's own interface. Virtual interfaces the ldn library creates get other
+    MACs (the base MAC plus one, two...), and udev may rename them (e.g. to wlx<mac>), so neither
+    the name nor the wlx prefix identifies them; the phy's permanent MAC does."""
+    base = _read(f"/sys/class/ieee80211/{phy}/macaddress")
+    return base is not None and _read(f"/sys/class/net/{iface}/address") == base
+
+
+def delete_vifs(phys, log=print):
+    """Delete every interface on `phys` except the adapter's own, whatever udev renamed it to."""
+    mapping = list_phy_ifaces()
+    for phy in {p for p in phys if p}:
+        for iface in mapping.get(phy, []):
+            if not _is_base_iface(phy, iface):
+                _iw_del(iface)
+                log(f"[live] removed virtual interface {iface} ({phy})")
+
+
 def free_radio(phys, log=print):
     """Delete leftover LDN vifs and take any other interface off the radio so the station can
     grab the channel (fixes SET_CHANNEL -> EBUSY). Brings your normal Wi-Fi down on that adapter
     for the duration (hand it back to NetworkManager afterwards). Needs root."""
+    delete_vifs(phys, log)
     mapping = list_phy_ifaces()
     for phy in {p for p in phys if p}:
         for iface in mapping.get(phy, []):
@@ -176,14 +209,20 @@ def free_radio(phys, log=print):
 
 
 def _iface_exists(iface):
-    import os
     return os.path.exists(f"/sys/class/net/{iface}")
 
 
-def light_cleanup(log=print):
-    """Delete the LDN virtual interfaces (teardown)."""
+def light_cleanup(phys=(), log=print):
+    """Delete the LDN virtual interfaces (teardown), renamed or not.
+
+    For compatibility this still accepts the old single-argument form, light_cleanup(log).
+    """
+    if callable(phys):                              # old signature: light_cleanup(log)
+        log, phys = phys, ()
+    delete_vifs(phys, log)
     for iface in sorted(LDN_VIFS):
-        _iw_del(iface)
+        if _iface_exists(iface):
+            _iw_del(iface)
     time.sleep(0.3)
 
 
@@ -350,12 +389,15 @@ class LiveTransport:
                 return self
             self._stop.set()
             if self._thread is not None:
-                self._thread.join(timeout=2)            # let an abandoned attempt unwind/disconnect
+                self._thread.join(timeout=5)            # let an abandoned attempt unwind/disconnect
+                if self._thread.is_alive():
+                    self.log("[live] previous join attempt is still running; its interface may "
+                             "linger until it exits")
             if attempt < attempts:
                 self.log(f"[live] retrying LDN join in {settle}s "
                          f"(attempt {attempt + 1}/{attempts})...")
                 time.sleep(settle)                      # let the radio settle before retrying
-        light_cleanup(self.log)                         # remove any vif a failed attempt leaked
+        light_cleanup({self.phyname}, self.log)         # remove any vif a failed attempt leaked
         raise RuntimeError(f"LDN join failed after {attempts} attempt(s):\n{last_err}")
 
     def _run_ldn(self):
@@ -366,6 +408,12 @@ class LiveTransport:
             self._err = f"missing dep for live mode: {e}"
             self._ready.set()
             return
+
+        # Show the ldn library's join diagnostics (channel, nl80211 events).
+        import logging
+        if not logging.getLogger().handlers:
+            logging.basicConfig(format="[ldn] %(message)s")
+        logging.getLogger("ldn.wlan").setLevel(logging.INFO)
 
         async def main():
             keys = ldn.load_keys(self.keys_path)
@@ -379,7 +427,7 @@ class LiveTransport:
                 # joinable filter but then rejects our auth, surfacing as an opaque trio timeout - logging
                 # it makes "this Switch isn't accepting this MAC" diagnosable.
                 self.log(f"[live] saw network comm_id=0x{n.local_communication_id:016x} "
-                         f"scene={n.scene_id} app_version={n.app_version} {n.num_participants}/{n.max_participants} "
+                         f"channel={n.channel} scene={n.scene_id} app_version={n.app_version} {n.num_participants}/{n.max_participants} "
                          f"accept_policy={getattr(n, 'accept_policy', '?')}")
             # Prefer an exact FRLG comm-id match; else fall back to the only joinable network.
             net = next((n for n in joinable
@@ -407,10 +455,25 @@ class LiveTransport:
             param.phyname = self.phyname              # wifi phy (like the bridge: phy0)
             param.ifname = self.ifname                # station iface (like the bridge: ldnclient)
             self.info("Joining the host...")
+            self.log(f"[live] joining on channel {net.channel}")
+            async with trio.open_nursery() as nursery:
+                # Cancel the join from inside trio when start() gives up, so the ldn library's
+                # cleanup runs and deletes its interface instead of the thread being abandoned.
+                nursery.start_soon(watch_stop, nursery.cancel_scope)
+                await joined(param)
+
+        async def watch_stop(scope):
+            while not self._stop.is_set():
+                await trio.sleep(0.2)
+            scope.cancel()
+
+        async def joined(param):
             async with ldn.connect(param) as network:
                 info = network.info()
                 self.ssid = info.ssid
-                self.iface = self.ifname
+                # udev may have renamed the station interface; ask the library for its real name.
+                station = getattr(network, "_interface", None)
+                self.iface = station.name() if station is not None else self.ifname
                 # The host is participant 0 (the network creator); its IP fixes the 169.254.X subnet
                 # [ldn/__init__.py NetworkInfo.participants; the bridge's network_nodes]. Each
                 # ParticipantInfo carries ip_address + mac_address (the 6-byte LDN MAC = the Pia
@@ -436,8 +499,7 @@ class LiveTransport:
                          f"host={self.host_ip}/{self.host_mac.hex()}")
                 self.info("Joined.")
                 self._ready.set()
-                while not self._stop.is_set():
-                    await trio.sleep(0.2)
+                await trio.sleep_forever()              # until watch_stop cancels
 
         try:
             trio.run(main)
@@ -458,7 +520,7 @@ class LiveTransport:
     def _iface_mac(self):
         """Read the station interface's MAC as a last-resort fallback for our connection GUID."""
         try:
-            with open(f"/sys/class/net/{self.ifname}/address") as f:
+            with open(f"/sys/class/net/{self.iface or self.ifname}/address") as f:
                 return bytes.fromhex(f.read().strip().replace(":", ""))
         except OSError:
             return None
@@ -466,7 +528,8 @@ class LiveTransport:
     def _iface_ip(self):
         """Read the IPv4 the ldn lib actually assigned to the station iface (ground truth)."""
         try:
-            out = subprocess.check_output(["ip", "-4", "-o", "addr", "show", "dev", self.ifname],
+            out = subprocess.check_output(["ip", "-4", "-o", "addr", "show", "dev",
+                                           self.iface or self.ifname],
                                           text=True, stderr=subprocess.DEVNULL)
             for line in out.splitlines():
                 parts = line.split()
@@ -565,5 +628,5 @@ class LiveTransport:
             except OSError:
                 pass
         if self._thread is not None:
-            self._thread.join(timeout=2)
-        light_cleanup(self.log)                         # delete the LDN vifs on teardown
+            self._thread.join(timeout=5)
+        light_cleanup({self.phyname}, self.log)         # delete the LDN vifs on teardown

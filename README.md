@@ -33,6 +33,11 @@ This demo was recorded using the **ALFA AWUS036ACHM**. The RZ616 is half as fast
 | AMD RZ616        | Internal (M.2) | mt7921e | Low          |
 | ALFA AWUS036ACHM | External       | mt76x0u | High         |
 | Realtek RTL8821CE | Internal (PCIe 1x) | rtw88_8821ce | High |
+| Ralink RT5370 | External (USB) | rt2800usb | High¹ |
+
+¹ 2.4 GHz only, and the successful runs had the driver loaded with `nohwcrypt=1`
+(`sudo modprobe rt2800usb nohwcrypt=1`). If a join stalls on this card it is almost always
+NetworkManager rather than the card — see Setup step 2.
 
 ### Known Problematic WiFi Cards
 
@@ -59,7 +64,22 @@ Above is the configuration I suggest using if you'd like a quick and easy demons
 
 **Setup**
 1. Create a Python venv and install all requirements in ``requirements.txt``
-2. Ensure your WiFi card is unmanaged. The easiest way to accomplish this is stopping NetworkManager.
+2. Keep NetworkManager away from the adapter **and from the interfaces the library creates on it**.
+   Do not stop NetworkManager: on a laptop whose Wi-Fi card also carries your normal connection, that
+   kills your network (and any SSH session with it). Mark the card unmanaged by *driver* instead, which
+   also covers the `ldn`/`ldnclient` interface the library creates when it joins. Put this in
+   ``/etc/NetworkManager/conf.d/99-ldn-unmanaged.conf`` (replace `rt2800usb` with your card's driver):
+
+   ```ini
+   [keyfile]
+   unmanaged-devices=driver:rt2800usb;interface-name:ldn*
+   ```
+
+   then run ``sudo systemctl reload NetworkManager``.
+
+   Marking only the base interface (`nmcli dev set <if> managed no`) is **not** enough: the library's
+   own interface appears later, so NetworkManager picks that one up, scans/configures it, and the join
+   never completes — it looks like a bare hang, with no authentication attempt in `dmesg`.
 3. Ensure you can become root. The script requires root to run.
 
 **Step-by-step Usage**
